@@ -23,6 +23,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      - name: Check release contract
+        run: bash scripts/check-release-contract.sh
+
       - name: Build check
         run: cargo check
 

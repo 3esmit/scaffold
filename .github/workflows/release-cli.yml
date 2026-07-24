@@ -1,0 +1,247 @@
+name: Publish CLI
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Alpha semver to publish, with or without the v prefix
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Validate version and source
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" != "refs/heads/master" ]]; then
+            echo "::error::Releases must be dispatched from master."
+            exit 1
+          fi
+
+          version="${INPUT_VERSION#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+$ ]]; then
+            echo "::error::Expected an alpha version such as 0.2.1-alpha.1."
+            exit 1
+          fi
+
+          manifest_version="$(
+            cargo metadata --locked --no-deps --format-version 1 |
+              jq -er '.packages[] | select(.name == "logos-scaffold") | .version'
+          )"
+          if [[ "$manifest_version" != "$version" ]]; then
+            echo "::error::Cargo.toml has version '$manifest_version', requested '$version'."
+            exit 1
+          fi
+
+          if ! grep -Fq "## [$version]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no entry for $version."
+            exit 1
+          fi
+
+          tag="v${version}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "::error::Tag ${tag} already exists."
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Check release contract
+        run: bash scripts/check-release-contract.sh
+
+      - name: Test release source
+        run: cargo test --locked --all-targets
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs_on: ubuntu-24.04
+            host_arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            platform: linux-amd64
+          - runs_on: macos-15
+            host_arch: arm64
+            target: aarch64-apple-darwin
+            platform: darwin-arm64
+    runs-on: ${{ matrix.runs_on }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+
+      - name: Confirm native runner architecture
+        env:
+          EXPECTED_ARCH: ${{ matrix.host_arch }}
+        run: |
+          set -euo pipefail
+          actual_arch="$(uname -m)"
+          if [[ "$actual_arch" != "$EXPECTED_ARCH" ]]; then
+            echo "::error::Expected native $EXPECTED_ARCH runner, got $actual_arch."
+            exit 1
+          fi
+
+      - name: Build release binaries
+        run: cargo build --locked --release --target "${{ matrix.target }}" --bins
+
+      - name: Smoke-test release binaries
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          binary_dir="target/${TARGET}/release"
+          for binary in logos-scaffold lgs; do
+            version_output="$("${binary_dir}/${binary}" --version)"
+            if [[ "$version_output" != "logos-scaffold ${VERSION}" ]]; then
+              echo "::error::Unexpected ${binary} version output: ${version_output}"
+              exit 1
+            fi
+            "${binary_dir}/${binary}" --help >/dev/null
+          done
+
+      - name: Package release archive
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          package="logos-scaffold-v${VERSION}-${PLATFORM}"
+          package_dir="${RUNNER_TEMP}/${package}"
+          archive="${RUNNER_TEMP}/${package}.tar.gz"
+
+          mkdir -p "$package_dir" "${RUNNER_TEMP}/dist"
+          install -m 0755 "target/${TARGET}/release/logos-scaffold" "$package_dir/"
+          install -m 0755 "target/${TARGET}/release/lgs" "$package_dir/"
+          install -m 0644 README.md LICENSE-APACHE LICENSE-MIT "$package_dir/"
+          tar -C "$RUNNER_TEMP" -czf "$archive" "$package"
+          tar -tzf "$archive"
+          mv "$archive" "${RUNNER_TEMP}/dist/"
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cli-${{ matrix.platform }}
+          path: ${{ runner.temp }}/dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download release archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: cli-*
+          path: dist
+          merge-multiple: true
+
+      - name: Build and verify checksum manifest
+        run: |
+          set -euo pipefail
+          cd dist
+          mapfile -t archives < <(
+            find . -maxdepth 1 -type f -name '*.tar.gz' -printf '%f\n' | sort
+          )
+          if [[ "${#archives[@]}" -ne 2 ]]; then
+            echo "::error::Expected two release archives, found ${#archives[@]}."
+            exit 1
+          fi
+          sha256sum -- *.tar.gz > SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      - name: Publish verified prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          cleanup_release=true
+          cleanup() {
+            if [[ "$cleanup_release" == "true" ]]; then
+              gh release delete "$TAG" --yes --cleanup-tag >/dev/null 2>&1 || true
+              git push origin ":refs/tags/${TAG}" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup EXIT
+
+          notes="${RUNNER_TEMP}/release-notes.md"
+          awk -v heading="## [${VERSION}]" '
+            index($0, heading) == 1 { found = 1; print; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > "$notes"
+          if [[ ! -s "$notes" ]]; then
+            echo "::error::Could not extract changelog entry for ${VERSION}."
+            exit 1
+          fi
+
+          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes-file "$notes" \
+            --draft \
+            --prerelease
+
+          verify_dir="${RUNNER_TEMP}/published-assets"
+          mkdir -p "$verify_dir"
+          gh release download "$TAG" --dir "$verify_dir"
+          diff -u dist/SHA256SUMS "$verify_dir/SHA256SUMS"
+          (
+            cd "$verify_dir"
+            sha256sum -c SHA256SUMS
+          )
+
+          gh release edit "$TAG" --draft=false --prerelease
+          cleanup_release=false
+          trap - EXIT
