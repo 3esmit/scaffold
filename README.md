@@ -51,6 +51,40 @@ Localnet and process/port detection rely on Unix tools (lsof, ps, kill).
 
 ## Install
 
+### Release archive
+
+Alpha releases provide source-owned archives for Linux AMD64 and Darwin
+ARM64. Each archive contains both `logos-scaffold` and the shorter `lgs`
+alias.
+
+```bash
+VERSION=0.2.1-alpha.1
+# Use linux-amd64 on Linux or darwin-arm64 on Apple Silicon.
+PLATFORM=linux-amd64
+ARCHIVE="logos-scaffold-v${VERSION}-${PLATFORM}.tar.gz"
+BASE_URL="https://github.com/3esmit/scaffold/releases/download/v${VERSION}"
+
+curl -fLO "${BASE_URL}/${ARCHIVE}"
+curl -fLO "${BASE_URL}/SHA256SUMS"
+grep "  ${ARCHIVE}$" SHA256SUMS > SHA256SUMS.selected
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum -c SHA256SUMS.selected
+else
+  shasum -a 256 -c SHA256SUMS.selected
+fi
+
+tar -xzf "${ARCHIVE}"
+mkdir -p "$HOME/.local/bin"
+install -m 0755 \
+  "logos-scaffold-v${VERSION}-${PLATFORM}/logos-scaffold" \
+  "logos-scaffold-v${VERSION}-${PLATFORM}/lgs" \
+  "$HOME/.local/bin/"
+```
+
+Alpha artifacts are prereleases. Review the release notes before upgrading.
+
+### Build from source
+
 ```bash
 cargo install --path .
 ```
