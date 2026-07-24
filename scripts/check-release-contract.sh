@@ -52,6 +52,9 @@ if ! grep -Fq 'repository = "https://github.com/3esmit/scaffold"' Cargo.toml; th
 fi
 
 require_text "runs_on: ubuntu-24.04"
+require_text "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+require_text "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+require_text "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
 require_text "host_arch: x86_64"
 require_text "target: x86_64-unknown-linux-gnu"
 require_text "platform: linux-amd64"
