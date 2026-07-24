@@ -1,6 +1,19 @@
 name: Publish CLI
 
 on:
+  pull_request:
+    paths:
+      - ".github/workflows/release-cli.yml"
+      - "scripts/check-release-contract.sh"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "templates/**"
+      - "skills/**"
+      - "docs/**"
+      - "README.md"
+      - "CHANGELOG.md"
+      - "LICENSE-*"
   workflow_dispatch:
     inputs:
       version:
@@ -34,25 +47,29 @@ jobs:
       - name: Validate version and source
         id: version
         env:
+          EVENT_NAME: ${{ github.event_name }}
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-
-          if [[ "$GITHUB_REF" != "refs/heads/master" ]]; then
-            echo "::error::Releases must be dispatched from master."
-            exit 1
-          fi
-
-          version="${INPUT_VERSION#v}"
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+$ ]]; then
-            echo "::error::Expected an alpha version such as 0.2.1-alpha.1."
-            exit 1
-          fi
 
           manifest_version="$(
             cargo metadata --locked --no-deps --format-version 1 |
               jq -er '.packages[] | select(.name == "logos-scaffold") | .version'
           )"
+          version="$manifest_version"
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ "$GITHUB_REF" != "refs/heads/master" ]]; then
+              echo "::error::Releases must be dispatched from master."
+              exit 1
+            fi
+            version="${INPUT_VERSION#v}"
+          fi
+
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+$ ]]; then
+            echo "::error::Expected an alpha version such as 0.2.1-alpha.1."
+            exit 1
+          fi
+
           if [[ "$manifest_version" != "$version" ]]; then
             echo "::error::Cargo.toml has version '$manifest_version', requested '$version'."
             exit 1
@@ -64,7 +81,8 @@ jobs:
           fi
 
           tag="v${version}"
-          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]] &&
+            git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
             echo "::error::Tag ${tag} already exists."
             exit 1
           fi
@@ -166,6 +184,7 @@ jobs:
           retention-days: 7
 
   publish:
+    if: github.event_name == 'workflow_dispatch'
     needs:
       - validate
       - build
