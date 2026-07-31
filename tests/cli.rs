@@ -2284,6 +2284,47 @@ fn deploy_plain_output_has_single_program_id_line_per_program() {
 }
 
 #[test]
+fn deploy_aborts_remaining_programs_when_head_stalls() {
+    // PR #241 review: a pacing timeout must gate the next submission.
+    // Continuing unpaced after a stalled head can batch the remaining ELFs
+    // into one block and recreate the fatal oversized-inscription sequencer
+    // crash, so the deploy aborts fail-closed: first program submitted,
+    // every remaining program marked failed, non-zero exit.
+    let temp = tempdir().expect("tempdir");
+    let rpc = RpcStub::start_stalled();
+    setup_wallet_project(temp.path(), Some(&rpc.url));
+    write_guest_program(temp.path(), "alpha");
+    write_guest_program(temp.path(), "beta");
+    write_guest_binary(temp.path(), "alpha");
+    write_guest_binary(temp.path(), "beta");
+
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("logos-scaffold"))
+        .current_dir(temp.path())
+        .env("LOGOS_SCAFFOLD_DEPLOY_PACING_TIMEOUT_MS", "200")
+        .arg("deploy")
+        .output()
+        .expect("run deploy against a stalled head");
+
+    assert!(
+        !output.status.success(),
+        "a pacing abort must exit non-zero"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("OK  alpha submitted"),
+        "first program must be submitted before the stall is detected:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("FAIL beta not submitted") && stdout.contains("deploy pacing aborted"),
+        "remaining program must be aborted fail-closed, not submitted unpaced:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Succeeded: 1") && stdout.contains("Failed: 1"),
+        "summary must reflect one submitted + one aborted program:\n{stdout}"
+    );
+}
+
+#[test]
 fn deploy_program_path_json_includes_program_id() {
     let temp = tempdir().expect("tempdir");
     let rpc = RpcStub::start();
@@ -2595,7 +2636,7 @@ fn spel_proxy_forwards_args_to_vendored_binary() {
         .current_dir(temp.path())
         .arg("spel")
         .arg("--")
-        .arg("inspect")
+        .arg("program-id")
         .arg("methods/guest/foo.bin")
         .assert()
         .success()
@@ -2617,7 +2658,7 @@ fn spel_proxy_works_with_leading_quiet_flag() {
         .arg("--quiet")
         .arg("spel")
         .arg("--")
-        .arg("inspect")
+        .arg("program-id")
         .arg("methods/guest/foo.bin")
         .assert()
         .success()
@@ -2628,7 +2669,7 @@ fn spel_proxy_works_with_leading_quiet_flag() {
         .arg("-q")
         .arg("spel")
         .arg("--")
-        .arg("inspect")
+        .arg("program-id")
         .arg("methods/guest/foo.bin")
         .assert()
         .success();
@@ -2648,7 +2689,7 @@ fn spel_proxy_accepts_quiet_between_subcommand_and_separator() {
         .arg("spel")
         .arg("-q")
         .arg("--")
-        .arg("inspect")
+        .arg("program-id")
         .arg("methods/guest/foo.bin")
         .assert()
         .success()
@@ -2664,7 +2705,7 @@ fn spel_proxy_accepts_quiet_between_subcommand_and_separator() {
         .arg("spel")
         .arg("--quiet")
         .arg("--")
-        .arg("inspect")
+        .arg("program-id")
         .arg("methods/guest/foo.bin")
         .assert()
         .success();
@@ -2680,7 +2721,7 @@ fn spel_proxy_forwards_nonzero_exit_code() {
         .env("SPEL_FAIL", "1")
         .arg("spel")
         .arg("--")
-        .arg("inspect")
+        .arg("program-id")
         .arg("foo.bin")
         .assert()
         .failure();
@@ -2696,7 +2737,7 @@ fn spel_proxy_hints_when_binary_missing() {
         .current_dir(temp.path())
         .arg("spel")
         .arg("--")
-        .arg("inspect")
+        .arg("program-id")
         .arg("foo.bin")
         .assert()
         .failure()
@@ -2727,13 +2768,14 @@ fn spel_without_dash_dash_suggests_passthrough_form() {
     Command::new(assert_cmd::cargo::cargo_bin!("logos-scaffold"))
         .current_dir(temp.path())
         .arg("spel")
-        .arg("inspect")
+        .arg("program-id")
         .arg("foo.bin")
         .assert()
         .failure()
         .stderr(
-            predicate::str::contains("Did you mean")
-                .and(predicate::str::contains("logos-scaffold spel -- inspect")),
+            predicate::str::contains("Did you mean").and(predicate::str::contains(
+                "logos-scaffold spel -- program-id",
+            )),
         );
 }
 
@@ -3597,9 +3639,10 @@ fn setup_wallet_project(project_root: &Path, sequencer_addr: Option<&str>) {
 }
 
 /// Place a minimal `spel` stub at `<spel_path>/target/release/spel`. It
-/// emits the canonical `   ImageID (hex bytes): <hex>` line that
-/// `extract_program_id` parses, with a deterministic-per-binary hash so
-/// tests can assert exact values. Honors:
+/// mirrors the spel v0.5.0 surface: `program-id <FILE>` emits the canonical
+/// `   ImageID (hex bytes): <hex>` line that `extract_program_id` parses,
+/// with a deterministic-per-binary hash so tests can assert exact values.
+/// Honors:
 ///   `SPEL_FAIL=1`              → exit non-zero (proxy exit-code test)
 ///   `SPEL_PROGRAM_ID_FAIL=<n>` → exit non-zero only when arg2 basename
 ///                                contains `<n>` (program-id-unavailable
@@ -3615,13 +3658,13 @@ if [ "${SPEL_FAIL:-0}" = "1" ]; then
   exit 7
 fi
 
-if [ "$#" -ge 2 ] && [ "$1" = "inspect" ]; then
+if [ "$#" -ge 2 ] && [ "$1" = "program-id" ]; then
   bin_path="$2"
   bin_name="$(basename "$bin_path")"
   if [ -n "${SPEL_PROGRAM_ID_FAIL:-}" ]; then
     case "$bin_name" in
       *"$SPEL_PROGRAM_ID_FAIL"*)
-        echo "spel stub: forced inspect failure for $bin_name" >&2
+        echo "spel stub: forced program-id failure for $bin_name" >&2
         exit 8
         ;;
     esac
@@ -3820,7 +3863,22 @@ struct RpcStub {
 }
 
 impl RpcStub {
+    /// Monotonically increasing head: deploy pacing waits for the block id
+    /// to advance between submissions, so a constant value would park every
+    /// multi-program deploy test in the pacing timeout. Incrementing per
+    /// poll mirrors a live sequencer.
     fn start() -> Self {
+        Self::start_with_advance(true)
+    }
+
+    /// Constant head: models a sequencer whose block production has stalled,
+    /// for asserting that deploy pacing aborts fail-closed instead of
+    /// batching the remaining ELFs unpaced.
+    fn start_stalled() -> Self {
+        Self::start_with_advance(false)
+    }
+
+    fn start_with_advance(advance: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind rpc stub");
         let addr = listener.local_addr().expect("local addr");
         let addr_str = addr.to_string();
@@ -3832,10 +3890,14 @@ impl RpcStub {
         let stop_flag = Arc::clone(&stop);
 
         let handle = thread::spawn(move || {
+            let mut block_id: u64 = 123;
             while !stop_flag.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        respond_last_block(&mut stream);
+                        respond_last_block(&mut stream, block_id);
+                        if advance {
+                            block_id += 1;
+                        }
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
@@ -3864,11 +3926,11 @@ impl Drop for RpcStub {
     }
 }
 
-fn respond_last_block(stream: &mut TcpStream) {
+fn respond_last_block(stream: &mut TcpStream, block_id: u64) {
     let mut buf = [0_u8; 4096];
     let _ = stream.read(&mut buf);
 
-    let body = r#"{"jsonrpc":"2.0","result":123,"id":1}"#;
+    let body = format!(r#"{{"jsonrpc":"2.0","result":{block_id},"id":1}}"#);
     let response = format!(
         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
         body.len(),
