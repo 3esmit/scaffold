@@ -74,7 +74,7 @@ Scaffold is also consumable as a Rust library (`logos_scaffold::api`): the same 
 
 - Unix-like environment with `git`, `rustc`, `cargo`, `lsof`, `ps`, and `kill`.
 - Docker or Podman available for guest builds.
-- `logos-blockchain-circuits` release on disk: `LOGOS_BLOCKCHAIN_CIRCUITS=<path>` or `~/.logos-blockchain-circuits/`. Required by the LEZ standalone build chain that `setup` invokes; absence causes a scaffold-side precheck error before any cargo work.
+- `logos-blockchain-circuits` release on disk when validating older projects without `[circuits]`: set `LOGOS_BLOCKCHAIN_CIRCUITS=<path>` (scaffold no longer consults `~/.logos-blockchain-circuits/`). New projects should carry a `[circuits]` table in `scaffold.toml`; `setup`, `build`, `build idl`, `localnet`, and test-node startup resolve and materialize the configured release instead of relying on ambient shell state.
 - No conflicting listener on the scaffold localnet port before `localnet start`.
 - Network access available for setup/build flows that fetch dependencies.
 - No preinstalled `wallet` binary is required. If one exists on `PATH`, do not treat it as the runtime under test for scaffold wallet scenarios.
@@ -110,6 +110,30 @@ mkdir -p "$EXT" && cp /tmp/cr/r0vm "$EXT/r0vm" && chmod +x "$EXT/r0vm"
 
 `find_r0vm_path_for_lez` looks at `~/.risc0/extensions/v<risc0-zkvm-version>-cargo-risczero-<arch>-<os>/r0vm`; placing r0vm there is what wires it into a spawned sequencer (scaffold sets `RISC0_SERVER_PATH` from it). The sequencer runs with `RISC0_DEV_MODE=1` (the test-node default), so r0vm executes guests without real proving — which is why no GPU/prover is needed.
 
+**2b. (Only for guest compilation — `build`, D-series/L-series.) Install the risc0 Rust toolchain.** `risc0-build` resolves the guest toolchain through rzup's directory layout; without one installed, `build` fails with `Risc Zero Rust toolchain not found. Try running rzup install rust`. When rzup itself is unusable (same TLS issue as above), install it from the `risc0/rust` release assets — the directory name must follow the `v<version>-rust-<triple>` pattern for discovery, and no `settings.toml` is needed (the highest installed version wins). Pick the newest available tag: guest dependency floats (e.g. `ruint`) carry MSRVs that outrun older toolchains — 1.88.0 already fails with `rustc 1.88.0-dev is not supported by the following packages` on a fresh default-template project.
+
+```bash
+TCVER=1.91.1   # tag r0.1.91.1 — newest published as of 2026-07
+curl -sSL -H "Authorization: Bearer $GH_TOKEN" -o /tmp/rust-tc.tar.gz \
+  "https://github.com/risc0/rust/releases/download/r0.$TCVER/rust-toolchain-$TRIPLE.tar.gz"
+DEST="$HOME/.risc0/toolchains/v$TCVER-rust-$TRIPLE"
+mkdir -p "$DEST" && tar xzf /tmp/rust-tc.tar.gz -C "$DEST"
+"$DEST/bin/rustc" --version                        # → rustc 1.91.1-dev
+```
+
+The `lez-framework` template's guest additionally compiles C (the default template's guests do not), so the L-series `build` also needs the risc0 **C++** toolchain; without it the guest build dies in cc-rs with `failed to find tool "/no_risc0_cpp_toolchain_installed_run_rzup_install_cpp"`. Same rzup layout, date-based version (dir uses the semver form of the tag, e.g. tag `2024.01.05` → dir `v2024.1.5`). The release asset (and the directory inside the tarball) is platform-specific and does **not** follow `$TRIPLE`: pick `riscv32im-linux-x86_64` on Linux x86_64 and `riscv32im-osx-arm64` on macOS arm64:
+
+```bash
+CPPASSET=riscv32im-linux-x86_64                    # riscv32im-osx-arm64 on macOS arm64
+curl -sSL -H "Authorization: Bearer $GH_TOKEN" -o /tmp/cpp-tc.tar.xz \
+  "https://github.com/risc0/toolchain/releases/download/2024.01.05/$CPPASSET.tar.xz"
+CPPDEST="$HOME/.risc0/toolchains/v2024.1.5-cpp-$TRIPLE"
+mkdir -p /tmp/cpp-tc && tar xJf /tmp/cpp-tc.tar.xz -C /tmp/cpp-tc
+mkdir -p "$CPPDEST" && mv /tmp/cpp-tc/"$CPPASSET"/* "$CPPDEST/"
+ln -sfn "$CPPDEST" "$HOME/.risc0/cpp"
+"$CPPDEST/bin/riscv32-unknown-elf-gcc" --version   # → gcc 13.2.0
+```
+
 **3. Build the real sequencer.** `test-node prepare` downloads the circuits release (via `curl`, automatically) and builds `sequencer_service`. It is long (~6 min); run it, then confirm doctor is green:
 
 ```bash
@@ -117,10 +141,9 @@ mkdir -p "$EXT" && cp /tmp/cr/r0vm "$EXT/r0vm" && chmod +x "$EXT/r0vm"
 "$SCAFFOLD_BIN" test-node doctor  --project "$P" --json | jq .ok   # → true (all checks pass)
 ```
 
-**4. (Only for real transactions — T4) build the wallet via `setup`.** Two gotchas distinguish `setup` from `test-node prepare`: its circuits precheck does **not** consult the scaffold cache (it only accepts `LOGOS_BLOCKCHAIN_CIRCUITS` or `$HOME/.logos-blockchain-circuits/`), so ensure one of those is present before running it; and it uses cwd discovery, so it must run **inside** the project (no `--project` flag):
+**4. (Only for real transactions — T4) build the wallet via `setup`.** One gotcha distinguishes `setup` from `test-node prepare`: it uses cwd discovery, so it must run **inside** the project (no `--project` flag). Circuits need no manual provisioning here — projects with a `[circuits]` table (every freshly generated one) materialize the pinned release into `.scaffold/circuits` during `setup` automatically; set `LOGOS_BLOCKCHAIN_CIRCUITS` only to override with a local checkout (the env var wins when set):
 
 ```bash
-export LOGOS_BLOCKCHAIN_CIRCUITS="$("$SCAFFOLD_BIN" test-node pins --project "$P" --json | jq -r .circuits_path)"
 ( cd "$P" && "$SCAFFOLD_BIN" setup )   # builds wallet + spel, seeds the default wallet (~3 min) → "setup complete"
 ```
 
@@ -130,7 +153,7 @@ Sanity-check the provisioned toolchain before running the T-series:
 "$EXT/r0vm" --version
 ls "$LEZ/target/release/sequencer_service"          # real sequencer (T1–T3)
 ls "$LEZ/target/release/wallet"                     # real wallet (T4)
-ls "$LOGOS_BLOCKCHAIN_CIRCUITS"/pol/verification_key.json
+ls "$P"/.scaffold/circuits/pol/verification_key.json   # project-local [circuits] install
 ```
 
 If any of these is missing, do not "skip the real run" — go back and fix the step that produced it.
@@ -154,10 +177,11 @@ If any of these is missing, do not "skip the real run" — go back and fix the s
 | E2 | N/A | Advanced | Project creation with advanced flags and invalid inputs | `new --template`, `new --vendor-deps`, `new --cache-root` |
 | E3 | N/A | Core | AI skills materialized into generated and adopted projects | `new`, `new --template lez-framework`, `init`, `init` re-run |
 | B1 | external module project | Core | Basecamp + lgpm setup and idempotent re-run | `init`, `basecamp setup`, `basecamp doctor`, `basecamp docs` |
-| B2 | external module project | Core | Module capture, install, and single-instance launch | `basecamp modules`, `basecamp modules --show`, `basecamp install`, `basecamp launch alice` |
-| B3 | external module project | Core | Two-instance p2p dogfooding | `basecamp launch alice`, `basecamp launch bob` (parallel) |
-| B4 | external module project | Advanced | Clean-slate scrub semantics on relaunch | `basecamp launch alice` (×2) |
-| B5 | external module project | Advanced | Portable artefact build for AppImage hand-loading | `basecamp build-portable` |
+| B2 | external module project | Core | Module capture, install, paths, and single-instance launch | `basecamp modules`, `basecamp modules --show`, `basecamp install`, `basecamp paths`, `basecamp launch <profile>` |
+| B3 | external module project | Core | Two-instance p2p dogfooding | `basecamp launch <profile>` (parallel) |
+| B4 | external module project | Advanced | Clean-slate and profile safety on relaunch | `basecamp launch <profile>` (×2), custom profile names |
+| B5 | external module project | Advanced | Module artefact builds by variant | `basecamp build`, `basecamp build-portable`, `--variant`, `--module` |
+| B6 | external module project | Advanced | Captured module run loop | `basecamp run <module>`, `--host standalone` |
 | A1 | N/A | Advanced | Public Rust API surface for embedding scaffold in tests/tooling | `logos_scaffold::api::Project`, `cargo doc`, doctests |
 | T1 | `default` | Advanced | Isolated test-node lifecycle and caller-project pins | `test-node pins`, `test-node prepare`, `test-node doctor`, `test-node start`, `test-node status`, `test-node stop`, `test-node run` |
 | T2 | `default` | Advanced | Typed RPC reads against a running test node | `test-node tx submit-and-wait`, `test-node blocks head/range/wait`, `test-node clock read/wait-stable`, `test-node account get/batch-get`, `test-node proof get`, `test-node snapshot accounts` |
@@ -207,10 +231,11 @@ Use `new` for the main runnable project and `create` as the lightweight alias-pa
 ### Expected Success Signals
 
 - Project creation succeeds and prints the destination path, pinned LEZ commit, and cache root.
+- Generated `scaffold.toml` includes a `[circuits]` table. The default install dir is project-local (`.scaffold/circuits`), and the configured version/download template/install dir become the single source of truth for commands that need `logos-blockchain-circuits`.
 - `setup` completes after syncing LEZ to the configured pin, building both `sequencer_service` and `wallet` inside the project's LEZ tree, and either seeding the default wallet or reporting that a default wallet is already configured. With `--prebuilt`: `sequencer_service` is downloaded instead of built from source (falls back to source build if no artifact is published); `wallet` is always built from source regardless of `--prebuilt`.
 - `localnet start` reports a ready localnet rather than only a spawned PID.
-- `build` exits successfully after preparing the project workspace, and — when the project has a `methods/Cargo.toml` (Risc0 guest crate excluded from the main workspace) — also prints `Building guest methods...` and produces a `methods/target/.../release` artifact.
-- `deploy` prints a submission summary with zero failures when built binaries are present.
+- `build` exits successfully after preparing the project workspace, resolving the configured circuits release, and — when the project has a `methods/Cargo.toml` (Risc0 guest crate excluded from the main workspace) — also prints `Building guest methods...` and produces a `methods/target/.../release` artifact.
+- `deploy` prints a submission summary with zero failures when built binaries are present. Multi-program deploys are paced one program per sequencer block (`Waiting for a new block past N before the next deployment ...` between submissions): the pinned LEZ settles each block as a single bedrock inscription with a ~896 KiB payload cap and panics fatally when a block exceeds it, so batching several ~370 KiB deployment ELFs into one block kills the sequencer. Expect roughly one `block_create_timeout` (15s) of wait per additional program. Pacing fails closed: a stalled head or an unreadable post-submission baseline aborts the remaining submissions with `deploy pacing aborted ...` and a non-zero exit rather than batching unpaced (re-run `deploy` for the rest once the sequencer recovers, or raise `LOGOS_SCAFFOLD_DEPLOY_PACING_TIMEOUT_MS` for slow block intervals). A deploy that continues unpaced and crashes localnet mid-flow is a regression; equally, record it if the upstream cap is lifted and pacing becomes dead weight.
 - `wallet topup` succeeds without an explicit address because the project default wallet was seeded during setup.
 - `wallet -- check-health` succeeds against the running localnet without requiring a global `wallet` install or manual `PATH` changes.
 - Generated `scaffold.toml` stores `[wallet].home_dir` but does not carry a wallet binary override; wallet location is derived from the pinned LEZ checkout.
@@ -228,6 +253,7 @@ Use `new` for the main runnable project and `create` as the lightweight alias-pa
 - Scaffold creation output for both `new` and `create`.
 - `setup`, `localnet start`, `build`, `deploy`, and wallet command excerpts.
 - The generated project path and the exact binary path used for the run.
+- `scaffold.toml` excerpt showing `[circuits]`, plus `ls .scaffold/circuits` or the configured install dir after `setup`/`build`.
 
 ### Execution Notes
 
@@ -266,6 +292,7 @@ If the scenario begins with localnet stopped, run `"$SCAFFOLD_BIN" localnet star
 - Human-readable `localnet status` clearly reports tracked PID, listener state, ownership, and readiness.
 - `localnet status --json` returns parseable JSON with at least `tracked_pid`, `listener_present`, `ownership`, and `ready`.
 - `doctor` returns actionable next steps rather than only raw failures.
+- `doctor` validates the configured circuits install path, checks the top-level `VERSION` file against `[circuits].version`, and warns when project config drifts from the LEZ pin's expected circuits release.
 - `doctor --json` returns parseable JSON with at least `status`, `summary`, `checks`, and `next_steps`.
 - `localnet logs --tail 200` returns useful recent log lines when logs exist.
 - `localnet stop` succeeds cleanly and subsequent status reflects the stopped state.
@@ -279,6 +306,7 @@ If the scenario begins with localnet stopped, run `"$SCAFFOLD_BIN" localnet star
 ### Evidence to Capture
 
 - Human-readable and JSON output for both `localnet status` and `doctor`.
+- If `[circuits]` is edited for the run, capture the matching `doctor` warning/error and the configured install dir.
 - A short `localnet logs` excerpt.
 - Stop behavior and the post-stop status output.
 
@@ -469,13 +497,14 @@ D1 validates the scaffold pipeline up to deploy and wallet health. This scenario
 
 - Default-template project exists with D1 completed (setup, build, deploy done).
 - Localnet is running and `wallet -- check-health` succeeds.
-- Create a fresh public account for this scenario:
+- Create **two** fresh public accounts for this scenario — one per runner. The first program to write an account becomes its `program_owner`, and the pinned LEZ rejects any later write to it by a different program with `UnauthorizedDataModification` (execution-check rejection visible only in the sequencer log; the runner still exits 0 because submission succeeded).
 
 ```bash
-"$SCAFFOLD_BIN" wallet -- account new public
+"$SCAFFOLD_BIN" wallet -- account new public   # <account-id-a> for run_hello_world
+"$SCAFFOLD_BIN" wallet -- account new public   # <account-id-b> for run_hello_world_with_move_function
 ```
 
-Capture the account ID from the output (format: `Public/<base58>`). Use the base58 portion as `<account-id>` below.
+Capture each account ID from the output (format: `Public/<base58>`). The runners take the bare base58 portion; `wallet account get` requires the full `Public/<base58>` form (the bare id fails with `Unsupported privacy kind`).
 
 ### Commands / Actions
 
@@ -483,24 +512,26 @@ From the generated project root:
 
 ```bash
 export NSSA_WALLET_HOME_DIR="$PWD/.scaffold/wallet"
-cargo run --bin run_hello_world -- <account-id>
-"$SCAFFOLD_BIN" wallet -- account get --account-id <account-id>
-cargo run --bin run_hello_world_with_move_function -- write-public <account-id> "dogfood-test-message"
-"$SCAFFOLD_BIN" wallet -- account get --account-id <account-id>
+cargo run --bin run_hello_world -- <account-id-a>
+"$SCAFFOLD_BIN" wallet -- account get --account-id Public/<account-id-a>
+cargo run --bin run_hello_world_with_move_function -- write-public <account-id-b> "dogfood-test-message"
+"$SCAFFOLD_BIN" wallet -- account get --account-id Public/<account-id-b>
 ```
 
-The first runner (`run_hello_world`) submits a basic public transaction. The second (`run_hello_world_with_move_function write-public`) writes a custom greeting string to the account, producing an observable `data_b64` field change.
+The first runner (`run_hello_world`) submits a basic public transaction; once committed, account A's data decodes to `Hola mundo!` and its `program_owner` is the hello_world program. The second (`run_hello_world_with_move_function write-public`) writes a custom greeting string to account B, producing an observable `data` field change. Reads are eventually consistent with block production (default localnet block interval 15s) — poll `account get` until the write lands.
 
 ### Expected Success Signals
 
-- Both runners print `submitted transaction: status=... tx_hash=...` on success.
+- Both runners print `submitted transaction: tx_hash=...` on success.
 - Both runners print a `verification hint:` line pointing to `wallet account get`.
-- After `run_hello_world_with_move_function write-public`, `wallet account get` shows account data containing the encoded greeting string.
+- After `run_hello_world`, account A shows `data` = hex(`Hola mundo!`) and a non-null `program_owner`.
+- After `run_hello_world_with_move_function write-public`, account B's `data` contains the hex-encoded greeting string.
 - Runner exit code is 0.
 
 ### Failure Signals / Common Pitfalls
 
-- If a runner exits 0 but the account remains `Uninitialized`, the transaction may have been submitted without effect. Record both the runner output and the account state.
+- If a runner exits 0 but the account remains `Uninitialized`, the transaction may have been submitted without effect. Record both the runner output and the account state — and check the sequencer log for `failed execution check` lines: submission-level success does not imply execution-level success.
+- Pointing both runners at the same account is the known execution-rejection case (`UnauthorizedDataModification` — see Preconditions), not a scaffold regression.
 - Panic output from a runner (e.g., `unwrap()` on wallet/sequencer errors) instead of a structured error is worth recording.
 - Invalid account ID format (not base58) should produce a clear parse error from the runner, not a panic.
 - If localnet is down, runners should fail with a connection-refused error. Capture the exact error text.
@@ -558,15 +589,28 @@ post_deploy = [
 "$SCAFFOLD_BIN" run --post-deploy "x" --no-post-deploy  # expect clap conflict error
 ```
 
+Then add a profile that owns deployment itself (`deploy = false`) and run it:
+
+```toml
+[run.profiles.self-deploy]
+deploy = false
+post_deploy = ["echo 'deploy skipped:' $SCAFFOLD_DEPLOY_SKIPPED"]
+```
+
+```bash
+"$SCAFFOLD_BIN" run --profile self-deploy   # skips step 5, still fires hooks
+```
+
 ### Expected Success Signals
 
 - The first `run` (no hooks configured) prints a numbered step header for each phase (`[1/5] Building...` through `[5/5] Deploying...`) and ends with a deployed-programs summary.
-- A second `run` reuses the running localnet (`localnet already running (sequencer pid=...)`) instead of starting a new sequencer.
+- A second `run` reuses the running localnet (`localnet already running (sequencer pid=...)`) instead of starting a new sequencer, and — when guest binaries, IDL, config, and sequencer are all unchanged — replaces `[5/N] Deploying...` with `[5/N] Deploy skipped (guest binaries + IDL + config + sequencer unchanged; pass --reset ...)`. Post-deploy hooks still fire after a dedup-skipped deploy. Use `--reset` (or delete `.scaffold/state/run_deploy.json`) when the scenario needs to force a real re-deploy.
 - After adding the `[run]` block, `run` reports `[6/6] Running N post-deploy hook(s)` and each hook prints a non-empty value for its env var. `cwd` for each hook is the project root (verifiable with a `pwd` hook). For a single-program project, `$SCAFFOLD_PROGRAM_ID` is the deployed program's risc0 image ID and `$SCAFFOLD_GUEST_BIN` is the absolute path to the guest binary.
 - `--post-deploy "echo override"` ignores `[run].post_deploy` and runs only the override.
 - `--no-post-deploy` skips the post-deploy step entirely; the run prints the deployed-programs summary instead.
 - `--post-deploy` with `--no-post-deploy` errors at clap parse time with a `cannot be used with` message; exit code is non-zero.
 - A non-zero hook exit aborts the run with a clear `post-deploy hook exited with status N` message.
+- With `deploy = false` in the selected profile, `run --profile self-deploy` prints ``[5/6] Deploy skipped (`deploy = false` in the run profile; ...)`` instead of `[5/6] Deploying...`, skips the program-hash/deploy work entirely, and still runs the `post_deploy` hooks. Each hook sees `SCAFFOLD_DEPLOY_SKIPPED=1` (here `echo 'deploy skipped:' $SCAFFOLD_DEPLOY_SKIPPED` prints `deploy skipped: 1`).
 
 ### Failure Signals / Common Pitfalls
 
@@ -580,6 +624,7 @@ post_deploy = [
 - Output of `run` after the `[run]` block is added, showing the `===> post_deploy[i/n]:` markers and the resolved env values.
 - Output of `run --post-deploy "echo override"` showing only the override hook fires.
 - Output of `run --no-post-deploy` showing the deployed-programs summary instead of hooks.
+- Output of `run --profile self-deploy` showing the ``[5/6] Deploy skipped (`deploy = false` ...)`` header and the `post_deploy` hook reporting `deploy skipped: 1`.
 
 ## L1. LEZ Template Bootstrap
 
@@ -738,9 +783,12 @@ From the LEZ project root:
 ```bash
 "$SCAFFOLD_BIN" deploy
 export NSSA_WALLET_HOME_DIR="$PWD/.scaffold/wallet"
+export HOST_CC=cc HOST_CXX=c++
 cargo run --bin run_lez_counter -- init --to <account-id>
 cargo run --bin run_lez_counter -- increment --counter <account-id> --authority <account-id> --amount 5
 ```
+
+`HOST_CC`/`HOST_CXX` matter for direct `cargo run` in lez-framework projects when the risc0 C++ toolchain is installed: the guest embed refingerprints under your shell env, risc0-build exports plain `CC` = riscv gcc, and the guest graph's host-side proc-macro deps (`spel-framework-macros` → … → `ring`) then compile host C with the riscv compiler and die on `-m64`. Scaffold's own `build`/IDL/client commands pin these automatically; direct cargo invocations need the export (CI's template-e2e does the same at the job level).
 
 ### Expected Success Signals
 
@@ -965,7 +1013,7 @@ ls dogfood-skills-default/AGENTS.md dogfood-skills-lez/AGENTS.md dogfood-skills-
 
 ### Goal
 
-Validate that a module project can fetch the pinned basecamp + `lgpm` binaries, seed the `alice` and `bob` profiles, and that re-running `setup` is idempotent.
+Validate that a module project can fetch the pinned basecamp + `lgpm` binaries, seed the default profiles, preserve configurable profile schema, and re-run `setup` idempotently.
 
 ### Preconditions
 
@@ -983,6 +1031,7 @@ cd "$MODULE_PROJECT"
 test -f scaffold.toml || "$SCAFFOLD_BIN" init
 "$SCAFFOLD_BIN" basecamp --help
 "$SCAFFOLD_BIN" basecamp docs | head
+grep -n '^\[repos.basecamp.attr\]\|^\[basecamp.profiles' scaffold.toml || true
 "$SCAFFOLD_BIN" basecamp setup
 ls .scaffold/basecamp/profiles
 "$SCAFFOLD_BIN" basecamp doctor
@@ -992,9 +1041,10 @@ ls .scaffold/basecamp/profiles
 
 ### Expected Success Signals
 
-- `basecamp --help` lists `setup`, `modules`, `install`, `launch`, `build-portable`, `doctor`, and `docs`.
-- `basecamp docs` prints the canonical project-compatibility rules (mirrors `docs/basecamp-module-requirements.md`).
+- `basecamp --help` lists `setup`, `modules`, `install`, `launch`, `paths`, `build-portable`, `doctor`, and `docs`.
+- `basecamp docs` prints the canonical project-compatibility rules, including per-profile `env_file`, `runtime_dir`, `log_file`, custom profile names, and per-platform `[repos.basecamp.attr]`.
 - First `basecamp setup` clones the pinned basecamp repo into a pin-isolated cache path, builds `basecamp` and `lgpm` via Nix, seeds `.scaffold/basecamp/profiles/alice/` and `.scaffold/basecamp/profiles/bob/`, and reports completion.
+- If `[repos.basecamp.attr]` is a per-platform map, setup uses the current host's attr and preserves the map plus scalar fallback on serialize.
 - `basecamp doctor` reports the basecamp + lgpm binaries as present and both profiles as seeded; `--json` returns parseable JSON with the same checks.
 - Second `basecamp setup` is idempotent: pin unchanged → no rebuild reported, exit 0.
 - All commands run only inside the project; running them from outside the project must fail with the existing scaffold "not a logos-scaffold project" message.
@@ -1013,6 +1063,7 @@ ls .scaffold/basecamp/profiles
 - First and second `basecamp setup` output (to compare rebuild vs. no-rebuild).
 - `basecamp doctor` and `basecamp doctor --json` output.
 - Listing of `.scaffold/basecamp/profiles/`.
+- Relevant `scaffold.toml` excerpt for `[repos.basecamp.attr]` and `[basecamp.profiles.*]` when present.
 
 ### Execution Notes
 
@@ -1023,7 +1074,7 @@ ls .scaffold/basecamp/profiles
 
 ### Goal
 
-Validate the per-project source of truth for module identity (`[modules]` in `scaffold.toml`), the install pipeline that builds `.lgx` artefacts and loads them via `lgpm`, and a single-profile launch.
+Validate the per-project source of truth for module identity (`[modules]` in `scaffold.toml`), the install pipeline that builds `.lgx` artefacts and loads them via `lgpm`, resolved profile paths, and a single-profile launch.
 
 ### Preconditions
 
@@ -1042,7 +1093,27 @@ grep -n '^\[modules\.' scaffold.toml
 "$SCAFFOLD_BIN" basecamp install
 "$SCAFFOLD_BIN" basecamp install --print-output
 "$SCAFFOLD_BIN" basecamp doctor
+"$SCAFFOLD_BIN" basecamp paths alice
+"$SCAFFOLD_BIN" basecamp paths alice --json
 "$SCAFFOLD_BIN" basecamp launch alice
+```
+
+To validate custom profile schema, add one profile and inspect it before launch:
+
+```toml
+[basecamp.profiles.maker]
+env_file = ".scaffold/basecamp/maker.env"
+runtime_dir = "/tmp/lgs-maker"
+log_file = ".scaffold/basecamp/profiles/maker/basecamp.log"
+
+[basecamp.profiles.maker.env]
+LOGOS_PROFILE_ROLE = "maker"
+```
+
+```bash
+printf 'MAKER_ONLY=1\nLOGOS_PROFILE_ROLE=env-file\n' > .scaffold/basecamp/maker.env
+"$SCAFFOLD_BIN" basecamp paths maker --json
+"$SCAFFOLD_BIN" basecamp launch maker --log-file
 ```
 
 If your project does not auto-discover correctly, capture explicit sources:
@@ -1060,6 +1131,8 @@ If your project does not auto-discover correctly, capture explicit sources:
 - `basecamp modules --show` prints the captured set without mutating state.
 - `basecamp install` builds each project source (sibling `--override-input` rewrites apply for `path:../<sibling>` inputs in multi-flake projects) and shells out to `lgpm` to install into both `alice` and `bob`. By default it logs to `.scaffold/logs/<ts>-install.log` and prints a one-line status; `--print-output` (or `LOGOS_SCAFFOLD_PRINT_OUTPUT=1`) streams nix output directly.
 - `basecamp doctor` reports each profile's installed modules matching the captured set; drift between `[modules]` and on-disk profile state is flagged, not hidden.
+- `basecamp paths <profile> --json` is pure path resolution: it emits parseable JSON for XDG config/data/cache, runtime dir, module/plugin dirs, launch state, log file, and env file without building or mutating anything.
+- Custom profile names launch like default profiles when they are a single safe path component; `env_file` is sourced before global/profile inline env, `runtime_dir` is exported as both `TMPDIR` and `XDG_RUNTIME_DIR`, and `--log-file` overrides the configured `log_file`.
 - `basecamp launch alice` kills any prior `logos_host` / `logos-basecamp` descendants for that profile, scrubs the profile's XDG dirs under `.scaffold/basecamp/profiles/alice/`, reinstalls each captured source for that profile, sets `XDG_{CONFIG,DATA,CACHE}_HOME` plus `LOGOS_PROFILE=alice`, and `exec`s basecamp.
 
 ### Failure Signals / Common Pitfalls
@@ -1069,6 +1142,8 @@ If your project does not auto-discover correctly, capture explicit sources:
 - An unresolved transitive `logos-module-builder` input that fails without naming the missing `follows` is a regression.
 - `install` succeeding when a build or `lgpm install` step actually failed is a fail; exit codes must be non-zero on any source failure.
 - `launch alice` with an empty `[modules]` must bail (rather than scrubbing the profile and leaving it empty).
+- Custom profile names that are empty, absolute, `.`, `..`, separator-containing, or contain control characters must be rejected before any filesystem work.
+- An env file key containing control characters must fail before spawning basecamp.
 - Sibling `--override-input` not being applied at probe time would surface as a build that resolves the wrong sibling pin during `basecamp modules` auto-discovery; record any such mismatch with the exact derived module names.
 
 ### Evidence to Capture
@@ -1077,7 +1152,9 @@ If your project does not auto-discover correctly, capture explicit sources:
 - `basecamp modules --show` output.
 - `basecamp install` log path under `.scaffold/logs/` plus the printed one-line status, or the `--print-output` stream.
 - `basecamp doctor` output post-install.
+- `basecamp paths <profile> --json` output for both a default profile and one configured profile.
 - The first lines of `basecamp launch alice` showing the kill → scrub → reinstall → exec sequence.
+- For log checks, the log path and first lines proving stdout/stderr were tee'd to file and terminal.
 
 ### Execution Notes
 
@@ -1112,13 +1189,17 @@ Terminal 2:
 "$SCAFFOLD_BIN" basecamp launch bob
 ```
 
+If the project defines custom profiles such as `maker` and `taker`, repeat the same two-terminal check with those names.
+
 Within the running UIs, exercise whatever p2p surface the module exposes (chat exchange, delivery between peers, storage round-trip). Capture screenshots or short transcripts.
 
 ### Expected Success Signals
 
 - Both basecamp windows open against their own profile dirs under `.scaffold/basecamp/profiles/{alice,bob}/`.
+- Custom profile pairs open against their own profile dirs under `.scaffold/basecamp/profiles/<profile>/` and their configured runtime/log/env paths.
 - Each window shows the project's `.lgx` modules installed and ready.
 - `LOGOS_PROFILE=alice` and `LOGOS_PROFILE=bob` are visible in each respective process environment (helpful for debugging).
+- On the macOS portable stack, each process environment carries an absolute `LOGOS_DATA_DIR` pointing at its own profile's module root — set automatically by `launch`, no manual export needed.
 - The two instances do not collide on Qt remote-objects or any non-module port; per-profile port-override env vars (per the spec) are set on each `launch`.
 - A p2p interaction triggered from `alice` is observable in `bob` (and vice versa) within the module's expected latency window.
 
@@ -1136,6 +1217,7 @@ Within the running UIs, exercise whatever p2p surface the module exposes (chat e
 - A short transcript or screenshot pair showing a p2p interaction propagating from one instance to the other.
 - The env block of each running process (e.g., `tr '\0' '\n' < /proc/<pid>/environ | grep -E 'XDG_|LOGOS_'`).
 - Any port-collision error text verbatim, with the module that owns the colliding port.
+- If custom profiles are used, `basecamp paths <profile> --json` for each profile and the resolved log/runtime dirs.
 
 ### Execution Notes
 
@@ -1146,7 +1228,7 @@ Within the running UIs, exercise whatever p2p surface the module exposes (chat e
 
 ### Goal
 
-Validate that `basecamp launch <profile>` scrubs profile state on every invocation — clean-slate is the v1 contract.
+Validate that `basecamp launch <profile>` scrubs profile state on every invocation and that profile/path safety guards bound all filesystem work to the project.
 
 ### Preconditions
 
@@ -1158,11 +1240,13 @@ From the module project root:
 
 ```bash
 "$SCAFFOLD_BIN" basecamp launch alice    # let it come up, then close it
+"$SCAFFOLD_BIN" basecamp paths alice --json
 ls .scaffold/basecamp/profiles/alice
 mkdir -p .scaffold/basecamp/profiles/alice/.scaffold-xdg-data/scratch
 echo "marker-$(date -u +%s)" > .scaffold/basecamp/profiles/alice/.scaffold-xdg-data/scratch/marker.txt
 "$SCAFFOLD_BIN" basecamp launch alice    # scrub-and-reinstall
 test -e .scaffold/basecamp/profiles/alice/.scaffold-xdg-data/scratch/marker.txt && echo "REGRESSION: marker survived clean launch" || echo "OK: marker scrubbed"
+"$SCAFFOLD_BIN" basecamp paths ../escape
 ```
 
 ### Expected Success Signals
@@ -1170,65 +1254,119 @@ test -e .scaffold/basecamp/profiles/alice/.scaffold-xdg-data/scratch/marker.txt 
 - `launch alice` removes any user-introduced files under the alice profile XDG dirs and reinstalls each captured source before `exec`ing basecamp.
 - `rm -rf` on `launch` is bounded to `<project>/.scaffold/basecamp/profiles/<profile>/`. Never any path outside that root.
 - A `launch` that finds no modules in `[modules]` bails before scrubbing (the empty-install + scrubbed profile combination is the regression we're guarding against).
+- `basecamp paths` rejects the same unsafe profile names as `launch` and remains non-mutating for valid profiles.
 
 ### Failure Signals / Common Pitfalls
 
 - The `marker.txt` file surviving `launch alice` is a regression: clean-slate is the v1 contract.
 - A `launch` scrubbing a path outside the profile's XDG dirs is a severe safety regression — capture the offending path and stop.
 - An empty `[modules]` plus a `launch` that wipes the profile and leaves it empty is a real regression; the empty-modules bail must fire first.
+- A custom `runtime_dir` on macOS that makes `<runtime_dir>/logos_token_<module>_<pid>` exceed the 104-byte Unix socket path budget is a dogfooding finding; keep custom values short, preferably under `/tmp`.
 
 ### Evidence to Capture
 
 - The marker write and the post-launch listing showing it was scrubbed.
 - The exact path under which the marker was placed and the path basecamp scrubbed (verify they match the profile root).
 - Any unexpected paths touched by `launch` outside `.scaffold/basecamp/profiles/<profile>/`.
+- The unsafe-profile rejection output from `basecamp paths ../escape`.
 
 ### Execution Notes
 
 - Use a marker filename and timestamp you can search for after the fact; do not rely on visual inspection alone.
 - Clean-slate state is project-local; never test scrub behavior against the user's global Logos directories.
 
-## B5. Build-Portable Artefacts for AppImage Hand-Loading
+## B5. Module Artefact Builds by Variant
 
 ### Goal
 
-Validate that project sources captured under `[modules]` with `role = "project"` can be built against their `#lgx-portable` flake output for hand-loading into a basecamp AppImage, and that runtime `role = "dependency"` entries are skipped.
+Validate that project sources captured under `[modules]` with `role = "project"` can be built against their `#lgx` and `#lgx-portable` flake outputs, that `--module` narrows the build, and that the old `build-portable` command remains a compatibility alias for the portable variant.
 
 ### Preconditions
 
 - B2 completed (project sources are captured and `basecamp install` has succeeded against `.#lgx`).
-- The same flakes also expose `packages.<system>.lgx-portable`.
+- The same flakes expose `packages.<system>.lgx` and, for portable checks, `packages.<system>.lgx-portable`.
 
 ### Commands / Actions
 
 From the module project root:
 
 ```bash
+"$SCAFFOLD_BIN" basecamp build --variant all
+"$SCAFFOLD_BIN" basecamp build --variant lgx --module <module-name>
+"$SCAFFOLD_BIN" basecamp build --variant lgx-portable --module <module-name>
 "$SCAFFOLD_BIN" basecamp build-portable
-ls .scaffold/basecamp/portable 2>/dev/null || find .scaffold -maxdepth 4 -name '*lgx-portable*' -o -name '*.tgz' | sort
+find .scaffold/basecamp -maxdepth 3 -type f -o -type l | sort
 ```
 
 ### Expected Success Signals
 
-- `build-portable` builds `.#lgx-portable` for each `role = "project"` entry in `[modules]`, in dependency order, and writes / symlinks the resulting artefacts under `.scaffold/`.
-- `role = "dependency"` entries are skipped — the target AppImage provides its own copies.
-- A flake that does not expose `.#lgx-portable` fails with a targeted error naming the missing attribute, not a raw nix trace.
+- `basecamp build --variant all` builds both `.#lgx` and `.#lgx-portable` for each `role = "project"` entry in dependency order, then writes/symlinks outputs under `.scaffold/basecamp/<variant-dir>/`.
+- `--module <module-name>` builds only that captured project module and fails clearly for an unknown module.
+- `build-portable` behaves like `basecamp build --variant lgx-portable` and keeps the historical `.scaffold/basecamp/portable/` output directory.
+- `role = "dependency"` entries are skipped by build commands; dependencies are runtime inputs provided by install/basecamp.
+- A flake that does not expose the requested variant fails with a targeted error naming the missing attribute, not a raw nix trace or silent fallback.
 
 ### Failure Signals / Common Pitfalls
 
-- A `build-portable` that silently falls back from `.#lgx-portable` to `.#lgx` is a contract violation — the variant choice is the user's.
+- Any requested variant that silently falls back to another variant is a contract violation.
+- An empty, duplicated, unknown, or path-like variant value through the Rust API must be rejected or normalized before filesystem work.
 - Building dependency entries (those with `role = "dependency"`) is wasted work and a behavior regression.
 - Out-of-order builds that ignore the dependency graph between project sources are a regression introduced by changes to ordering logic.
 
 ### Evidence to Capture
 
-- `basecamp build-portable` output excerpt including the per-source build lines.
+- `basecamp build` and `basecamp build-portable` output excerpts including the per-source build lines.
 - The directory listing of the produced artefacts under `.scaffold/`.
 - For any failure, the exact missing flake attribute and the offending project source.
 
 ### Execution Notes
 
-- This scenario does not exercise the AppImage itself — it stops at producing artefacts. Hand-loading into a basecamp AppImage is owned by the AppImage release, not by scaffold.
+- This scenario does not exercise the AppImage itself. Hand-loading into a basecamp AppImage is owned by the AppImage release, not by scaffold.
+
+## B6. Captured Module Run Loop
+
+### Goal
+
+Validate that `basecamp run` launches a captured module from its flake for the local development loop, and that host selection is predictable.
+
+### Preconditions
+
+- B2 completed and `[modules.<name>]` contains at least one `role = "project"` module captured from a flake, not from a prebuilt `.lgx` file.
+- For standalone UI checks, the module flake exposes `apps.<system>.default` or the attr named by `[modules.<name>].standalone_app`.
+
+### Commands / Actions
+
+From the module project root:
+
+```bash
+"$SCAFFOLD_BIN" basecamp run <module-name> --host standalone
+"$SCAFFOLD_BIN" basecamp run <module-name>
+```
+
+For one negative-path check, capture or hand-edit a module entry that points at a prebuilt `.lgx` path and run:
+
+```bash
+"$SCAFFOLD_BIN" basecamp run <path-captured-module>
+```
+
+### Expected Success Signals
+
+- `--host standalone` invokes `nix run` for the module flake's default app, or `#<standalone_app>` when that config key is set.
+- With no `--host`, the run defaults to `standalone` (the only host today).
+- A module captured as a prebuilt `.lgx` path is rejected with guidance to edit/remove the entry and capture a flake source; `nix run` is not attempted.
+- Running a module as a configured Basecamp peer (one-shot build + install + launch) is not yet available; use `basecamp install` then `basecamp launch <profile>`. Tracked as follow-up work.
+
+### Failure Signals / Common Pitfalls
+
+- Running a `.lgx` path source through `nix run` is a regression; path captures are installable artefacts, not flake apps.
+- A remote flake ref without an explicit fragment must still receive the requested app/build attr when scaffold constructs the Nix command.
+- An omitted `standalone_app` must not serialize back as `standalone_app = ""`.
+
+### Evidence to Capture
+
+- Command output for standalone/default-host/basecamp-host paths.
+- The `[modules.<name>]` excerpt showing `flake`, `role`, optional `standalone_app`, and whether the source is a flake or `.lgx` path.
+- Any rejected `.lgx` path-source error verbatim.
 
 ## A1. Public Rust API Surface
 
@@ -1324,18 +1462,19 @@ From the generated project root:
 # capture the node id (state_dir basename) and rpc_url from the JSON
 "$SCAFFOLD_BIN" test-node status --node <node-id> --json
 "$SCAFFOLD_BIN" test-node stop --node <node-id>
-"$SCAFFOLD_BIN" test-node run --serial -- sh -c 'echo "rpc=$LGS_TEST_NODE_RPC_URL port=$LGS_TEST_NODE_PORT"'
+"$SCAFFOLD_BIN" test-node run --serial --block-create-timeout-ms 500 --retry-pending-blocks-timeout-ms 500 -- sh -c 'echo "rpc=$LGS_TEST_NODE_RPC_URL port=$LGS_TEST_NODE_PORT"'
 ```
 
 The pin/prepare/doctor commands also accept `--project <root>` so they can be driven from outside the project directory.
 
 ### Expected Success Signals
 
-- `test-node pins` reports the LEZ source/ref, resolved commit, checkout path and ownership (`managed_cache` vs `caller_provided`), sequencer binary path, and circuits version/path — each annotated with its origin (`cli_override` → `project_config` → `scaffold_default`).
+- `test-node pins` reports the LEZ source/ref, resolved commit, checkout path and ownership (`managed_cache` vs `caller_provided`), sequencer binary path, and circuits version/path — each annotated with its origin (`cli_override` -> `project_config` -> `scaffold_default`). For projects with `[circuits]`, the reported circuits version matches the project config; startup should still materialize the configured circuits install before launching the node.
 - `test-node doctor` reports pin drift, checkout presence/commit/cleanliness, sequencer binary, circuits release, and platform support as separate categorized checks; exits non-zero only when a real prerequisite is missing.
 - `test-node prepare` resolves the project's pins, ensures the checkout + circuits, builds the standalone sequencer, and (with `--json`) reports the checkout, resolved commit, binary path, and circuits path.
 - `test-node start --json` prints at least `rpc_url`, `pid`, `state_dir`, `config_path`, `log_path`, `genesis_block_id`, and current `block_height`; the node runs on its own port under `.scaffold/test-nodes/<id>/` and does not touch the vendored LEZ checkout or the developer localnet.
 - `test-node start --port 0` (the default) selects an unused localhost port; `test-node status --node <id> --json` reports `healthy` and the served `rpc_url`, exiting non-zero when unhealthy.
+- `test-node start` / `test-node run` with `--block-create-timeout-ms` and `--retry-pending-blocks-timeout-ms` patch those sequencer config values as millisecond strings (for example, `500ms` for faster local tests) in the runtime `sequencer_config.json`; accepted values are 1 to 3,600,000 ms, and omitting them preserves the pinned debug config values. Values near or below the stable-read sample cadence can keep `clock wait-stable` and account-boundary reads from converging.
 - `test-node stop --node <id>` terminates only that node and removes its runtime state (unless `--preserve-work-dir`).
 - `test-node run -- <cmd>` starts a node, waits for health, exports `LGS_TEST_NODE_RPC_URL` / `LGS_TEST_NODE_PORT` / `LGS_TEST_NODE_STATE_DIR` (and friends) to the child, forwards the child's exit status, and stops the node afterward; `--serial` caps concurrent node creation at one and `--parallel N` at N.
 
@@ -1350,6 +1489,7 @@ The pin/prepare/doctor commands also accept `--project <root>` so they can be dr
 ### Evidence to Capture
 
 - `test-node pins --json` and `test-node doctor` output.
+- The circuits version from `test-node pins --json`, and the configured install dir after `test-node start` or another command that materializes project circuits.
 - `test-node start --json` output (the full connection record) and the `.scaffold/test-nodes/<id>/` listing.
 - `test-node status --json` for the running and stopped states.
 - `test-node run` output showing the exported `LGS_TEST_NODE_*` env reaching the child.
@@ -1547,21 +1687,24 @@ HEAD0=$("$SCAFFOLD_BIN" test-node blocks head --url "$URL" --json | jq -r .block
 - Changes to wallet flows or wallet-related defaults: rerun `D4`.
 - Changes to diagnostics, report contents, or redaction logic: rerun `D5`.
 - Changes to example runner binaries or template `src/bin/*` code: rerun `D6`.
-- Changes to `run` step ordering, post-deploy env vars, post-deploy CLI override flag handling, or `[run]` config parsing: rerun `D7`.
+- Changes to `run` step ordering, the `deploy = false` deploy-skip branch, post-deploy env vars, post-deploy CLI override flag handling, or `[run]` config parsing: rerun `D7`.
 - Changes to LEZ template scaffolding or generated outputs: rerun `L1`, `L2`, `L3`, and `L4`.
 - Changes to CLI argument parsing, help text, or error messages: rerun `E1`.
 - Changes to `create`/`new` flags or template selection logic: rerun `E2`.
 - Changes to AI skill materialization (`apply_skills`, the canonical `skills/` source, frontmatter rewrite, `AGENTS.md` template, or `init` re-run semantics): rerun `E3`.
-- Changes to `basecamp setup` (pin sync, lgpm build, profile seeding, idempotency) or `basecamp doctor`: rerun `B1`.
+- Changes to `basecamp setup` (pin sync, lgpm build, profile seeding, idempotency), per-platform `[repos.basecamp.attr]`, or `basecamp doctor`: rerun `B1`.
 - Changes to `[modules]` derivation, dependency resolution, sibling `--override-input` handling, or `basecamp install` invocation of `lgpm`: rerun `B2`.
-- Changes to `basecamp launch` (kill-and-scrub semantics, XDG isolation, port-override env vars, p2p surface): rerun `B3`.
-- Changes to clean-slate scrub semantics or the empty `[modules]` guard on `launch`: rerun `B4`.
-- Changes to `basecamp build-portable` (project/dependency role split, ordering, attr selection): rerun `B5`.
+- Changes to `basecamp paths`, `[basecamp.profiles.*]`, `env_file`, `runtime_dir`, `log_file`, `launch --log-file`, or single-profile launch path resolution: rerun `B2`.
+- Changes to `basecamp launch` (kill-and-scrub semantics, XDG isolation, runtime/log/env export, port-override env vars, p2p surface): rerun `B3`.
+- Changes to clean-slate scrub semantics, profile-name validation, path-root bounds, or the empty `[modules]` guard on `launch`: rerun `B4`.
+- Changes to `basecamp build`, `basecamp build-portable`, variant normalization, `--module` filtering, or build attr selection: rerun `B5`.
+- Changes to `basecamp run`, `standalone_app`, or module source validation for run: rerun `B6`.
 - Changes to the public `logos_scaffold::api` surface (entry points, typed result models, categorized errors, `CommandFailed`, or the documented examples/doctests): rerun `A1`, and rerun the matching CLI scenario for any command whose `*_for_project` core changed.
 - Changes to `test-node` lifecycle, pin resolution, prepare/doctor, run-slot concurrency, or caller-checkout validation: rerun `T1` (and `A1` if the `api::testnode` lifecycle types changed).
 - Changes to the `test-node` RPC client (transaction outcomes, block/clock parsing, account/proof reads, or their JSON shapes): rerun `T2`.
 - Changes to `test-node` state seeding (snapshot formats, validation classes, genesis-config injection, or database seeding): rerun `T3`.
 - Changes to the transaction-bearing block path (`sendTransaction`/`getBlock` handling, the committed-block scan, user-vs-clock classification, or the r0vm/sequencer spawn env): rerun `T4` (the only check that proves the path against a real executed transaction).
+- Changes to `[circuits]` config parsing/serialization, circuits install-dir resolution, circuits materialization/export, or `doctor` circuits checks: rerun `D1`, `D2`, `D6`, `T1`, `T4`, and `A1`.
 - Changes to circuits/r0vm provisioning, the LEZ/circuits pins, or the sequencer/wallet build invocation (`SEQUENCER_BUILD_ARGS`, `setup`): re-verify "Provisioning the Real LEZ Sequencer Toolchain", then rerun `T1` and `T4`.
 
 The `T`-series must be run against a real sequencer (see the Agent Execution Directives and the provisioning section). When in doubt, rerun more scenarios rather than fewer — and never substitute a stub for the real node in a `T` scenario.

@@ -44,9 +44,10 @@ pub(crate) const DEFAULT_SPEL: GitRef = GitRef {
 /// produces incompatible verifier keys, so bump this in lock-step with
 /// `DEFAULT_LB_PIN` / `DEFAULT_LEZ`.
 ///
-/// Materialised on demand into `<cache_root>/circuits/v<ver>-<triple>/` by
-/// `circuits::ensure_circuits_for_subprocess`. Override the version hop by
-/// setting `LOGOS_BLOCKCHAIN_CIRCUITS` to a populated checkout; the env var
+/// Default for `[circuits].version`. Materialised on demand into the
+/// project's `[circuits].install_dir` (default `.scaffold/circuits`) by
+/// `circuits::ensure_circuits_for_project`. Override by setting
+/// `LOGOS_BLOCKCHAIN_CIRCUITS` to a populated checkout; the env var
 /// short-circuits the download.
 pub(crate) const DEFAULT_CIRCUITS_VERSION: &str = "0.4.1";
 pub(crate) const LOGOS_BLOCKCHAIN_CIRCUITS_ENV: &str = "LOGOS_BLOCKCHAIN_CIRCUITS";
@@ -56,6 +57,11 @@ pub(crate) const CIRCUITS_RELEASE_BASE_URL: &str =
 pub(crate) const DEFAULT_HELLO_WORLD_IMAGE_ID_HEX: &str =
     "4880b298f59699c1e4263c5c2245c80123632d608b9116f4b253c63e6c340771";
 pub(crate) const DEFAULT_WALLET_PASSWORD: &str = "logos-scaffold-v0";
+pub(crate) const WALLET_CONFIG_REL_PATH: &str = "wallet/configs/debug/wallet_config.json";
+pub(crate) const WALLET_CONFIG_NESTED_REL_PATH: &str =
+    "lez/wallet/configs/debug/wallet_config.json";
+pub(crate) const WALLET_CONFIG_REL_PATHS: &[&str] =
+    &[WALLET_CONFIG_NESTED_REL_PATH, WALLET_CONFIG_REL_PATH];
 pub(crate) const WALLET_BIN_REL_PATH: &str = "target/release/wallet";
 pub(crate) const FRAMEWORK_KIND_DEFAULT: &str = "default";
 pub(crate) const FRAMEWORK_KIND_LEZ_FRAMEWORK: &str = "lez-framework";
@@ -70,6 +76,10 @@ pub(crate) const SEQUENCER_BIN_REL_PATH: &str = "target/release/sequencer_servic
 pub(crate) const METHODS_DIR: &str = "methods";
 pub(crate) const SEQUENCER_CONFIG_REL_PATH: &str =
     "sequencer/service/configs/debug/sequencer_config.json";
+pub(crate) const SEQUENCER_CONFIG_NESTED_REL_PATH: &str =
+    "lez/sequencer/service/configs/debug/sequencer_config.json";
+pub(crate) const SEQUENCER_CONFIG_REL_PATHS: &[&str] =
+    &[SEQUENCER_CONFIG_NESTED_REL_PATH, SEQUENCER_CONFIG_REL_PATH];
 pub(crate) const SPEL_BIN_REL_PATH: &str = "target/release/spel";
 /// Default seconds to wait for the sequencer to become ready when `lgs run`
 /// has to start localnet itself. Cold first runs (fresh repo clone, cold

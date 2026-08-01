@@ -183,8 +183,7 @@ impl Project {
             .map_err(error::classify)?;
         let spel_repo = resolve_repo_path(&self.inner, &self.inner.config.spel, "spel")
             .map_err(error::classify)?;
-        let circuits_dir =
-            crate::circuits::circuits_dir_for_cache_root(&cache_root).map_err(error::classify)?;
+        let circuits_dir = crate::circuits::circuits_dir_for_project(&self.inner);
         Ok(ProjectPaths {
             root: self.inner.root.clone(),
             scaffold_toml: self.inner.root.join("scaffold.toml"),
@@ -662,8 +661,23 @@ pub enum BasecampCommand {
         module: String,
         dev_shell: Option<String>,
     },
-    /// Attr-swap replay producing portable module builds.
+    /// Build project-module `.lgx` artefacts for one or more flake variants
+    /// (`lgx`, `lgx-portable`) without installing them. `module` narrows the
+    /// build to a single captured project module.
+    Build {
+        variants: Vec<String>,
+        module: Option<String>,
+    },
+    /// Attr-swap replay producing portable module builds (alias for
+    /// `Build { variants: ["lgx-portable"], module: None }`).
     BuildPortable,
+    /// Run a captured module via `nix run`. `host` accepts `standalone` (the
+    /// only host today, and the default when `None`); running a module as a
+    /// configured Basecamp peer is tracked as separate follow-up work.
+    Run {
+        module: String,
+        host: Option<String>,
+    },
     /// Basecamp-specific health checks.
     Doctor,
 }
@@ -684,9 +698,19 @@ impl BasecampCommand {
             Self::Install => BasecampAction::Install {
                 print_output: false,
             },
-            Self::Launch { profile } => BasecampAction::Launch { profile },
+            // The public API doesn't surface `--log-file`; default to no log
+            // (falls back to `[basecamp.profiles.<name>].log_file` if set).
+            Self::Launch { profile } => BasecampAction::Launch {
+                profile,
+                log_file: None,
+            },
             Self::Develop { module, dev_shell } => BasecampAction::Develop { module, dev_shell },
-            Self::BuildPortable => BasecampAction::BuildPortable,
+            Self::Build { variants, module } => BasecampAction::Build { variants, module },
+            Self::BuildPortable => BasecampAction::Build {
+                variants: vec!["lgx-portable".to_string()],
+                module: None,
+            },
+            Self::Run { module, host } => BasecampAction::Run { module, host },
             Self::Doctor => BasecampAction::Doctor { json: false },
         }
     }

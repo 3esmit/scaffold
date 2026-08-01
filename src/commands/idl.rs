@@ -7,11 +7,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-use crate::circuits::ensure_circuits_for_subprocess;
+use crate::circuits::ensure_circuits_for_project;
 use crate::constants::FRAMEWORK_KIND_LEZ_FRAMEWORK;
 use crate::model::Project;
-use crate::process::run_capture;
-use crate::project::{load_project, resolve_cache_root, run_in_project_dir};
+use crate::process::{apply_host_cc_overrides, run_capture};
+use crate::project::{load_project, run_in_project_dir};
 use crate::state::write_text;
 use crate::DynResult;
 
@@ -98,20 +98,23 @@ fn build_idl_inner(force: bool) -> DynResult<()> {
 
     // Same rationale as `setup`: the workspace test build pulls in the
     // logos-blockchain crates that need a populated circuits release.
-    let (cache_root, _) = resolve_cache_root(&project)?;
-    ensure_circuits_for_subprocess(&cache_root)?;
+    ensure_circuits_for_project(&project)?;
 
-    let out = run_capture(
-        Command::new("cargo")
-            .current_dir(&project.root)
+    let out = {
+        let mut cmd = Command::new("cargo");
+        cmd.current_dir(&project.root)
             .arg("test")
             .arg("--workspace")
             .arg("__lssa_idl_print")
             .arg("--")
             .arg("--show-output")
-            .arg("--quiet"),
-        "cargo test __lssa_idl_print",
-    )?;
+            .arg("--quiet");
+        // The workspace test build embeds the `methods/` guests; without the
+        // host-compiler pin the nested guest build breaks host-target C deps
+        // (see `apply_host_cc_overrides`).
+        apply_host_cc_overrides(&mut cmd);
+        run_capture(&mut cmd, "cargo test __lssa_idl_print")?
+    };
 
     let mut blocks = parse_idl_blocks(&out.stdout)?;
     if blocks.is_empty() {
@@ -424,6 +427,7 @@ ignored
                 basecamp_repo: None,
                 lgpm_repo: None,
                 wallet_home_dir: ".scaffold/wallet".to_string(),
+                circuits: crate::model::CircuitsConfig::default(),
                 framework: FrameworkConfig {
                     kind: FRAMEWORK_KIND_LEZ_FRAMEWORK.to_string(),
                     version: "0.1.0".to_string(),

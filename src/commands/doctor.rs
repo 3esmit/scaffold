@@ -86,7 +86,10 @@ pub(crate) fn build_doctor_report(project: &Project) -> DynResult<DoctorReport> 
     rows.push(check_binary("kill", true));
     rows.push(check_container_runtime());
     rows.push(check_binary("nix", false));
-    rows.push(check_logos_blockchain_circuits());
+    rows.push(check_logos_blockchain_circuits(
+        &project.root,
+        &project.config.circuits,
+    ));
 
     rows.push(check_repo("lez", &lez, &project.config.lez.pin));
 
@@ -402,7 +405,7 @@ pub(crate) fn print_report(report: &DoctorReport) {
 /// `DEFAULT_LEZ.tag`). When the two diverge, spel's sequencer-RPC client
 /// speaks a different LEZ protocol than the sequencer scaffold builds,
 /// which can break `lgs spel -- ...` subcommands that hit the sequencer
-/// (image-ID computation via `spel inspect` is unaffected — it only
+/// (image-ID computation via `spel program-id` is unaffected — it only
 /// touches the guest ELF).
 ///
 /// Reads `<spel_path>/spel-cli/Cargo.toml` and looks for either the SHA

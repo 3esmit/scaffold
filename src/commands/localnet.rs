@@ -6,10 +6,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context};
-use serde_json::Value;
 
-use crate::circuits::ensure_circuits_for_subprocess;
-use crate::constants::{SEQUENCER_BIN_REL_PATH, SEQUENCER_CONFIG_REL_PATH};
+use crate::circuits::ensure_circuits_for_project;
+use crate::constants::SEQUENCER_BIN_REL_PATH;
 use crate::error::{LocalnetError, ResetError};
 use crate::model::{
     LocalnetLogsReport, LocalnetOwnership, LocalnetState, LocalnetStatusReport, Project,
@@ -18,9 +17,8 @@ use crate::process::{
     command_echo_enabled, listener_pid, pid_alive, pid_command, pid_running, port_open,
     spawn_to_log,
 };
-use crate::project::{
-    ensure_dir_exists, find_project_root, load_project, resolve_cache_root, resolve_repo_path,
-};
+use crate::project::{ensure_dir_exists, find_project_root, load_project, resolve_repo_path};
+use crate::sequencer_config::{apply_common_runtime_overrides, patch_runtime_sequencer_config};
 use crate::state::{read_localnet_state, write_localnet_state};
 use crate::DynResult;
 
@@ -136,8 +134,7 @@ pub(crate) fn localnet_start_for_project(
     timeout_sec: u64,
 ) -> DynResult<LocalnetStartOutcome> {
     let ctx = localnet_context(project)?;
-    let (cache_root, _) = resolve_cache_root(project)?;
-    ensure_circuits_for_subprocess(&cache_root)?;
+    ensure_circuits_for_project(project)?;
     let (pid, reused) = start_localnet(
         &ctx.lez,
         &ctx.state_path,
@@ -180,8 +177,7 @@ pub(crate) fn localnet_reset_for_project(
     verify_timeout_sec: u64,
 ) -> DynResult<()> {
     let ctx = localnet_context(project)?;
-    let (cache_root, _) = resolve_cache_root(project)?;
-    ensure_circuits_for_subprocess(&cache_root)?;
+    ensure_circuits_for_project(project)?;
     cmd_localnet_reset(
         project,
         &ctx.lez,
@@ -198,21 +194,9 @@ pub(crate) fn localnet_reset_for_project(
 fn cmd_localnet_in_project(project: &Project, action: LocalnetAction) -> DynResult<()> {
     let ctx = localnet_context(project)?;
 
-    // The standalone `sequencer_service` binary calls into the
-    // `logos-blockchain-zksign` runtime, which loads circuit witness
-    // generators from `LOGOS_BLOCKCHAIN_CIRCUITS` (or `~/.logos-blockchain-circuits`)
-    // and panics if neither exists. Materialise the release if absent and
-    // export the env var so any subprocess we spawn here inherits it.
-    if matches!(
-        action,
-        LocalnetAction::Start { .. } | LocalnetAction::Reset { .. }
-    ) {
-        let (cache_root, _) = resolve_cache_root(project)?;
-        ensure_circuits_for_subprocess(&cache_root)?;
-    }
-
     match action {
         LocalnetAction::Start { timeout_sec } => {
+            ensure_circuits_for_project(project)?;
             let (pid, _) = start_localnet(
                 &ctx.lez,
                 &ctx.state_path,
@@ -243,17 +227,22 @@ fn cmd_localnet_in_project(project: &Project, action: LocalnetAction) -> DynResu
             yes,
             reset_wallet,
             verify_timeout_sec,
-        } => cmd_localnet_reset(
-            project,
-            &ctx.lez,
-            &ctx.state_path,
-            &ctx.log_path,
-            &ctx.localnet_addr,
-            dry_run,
-            yes,
-            reset_wallet,
-            verify_timeout_sec,
-        ),
+        } => {
+            if yes && !dry_run {
+                ensure_circuits_for_project(project)?;
+            }
+            cmd_localnet_reset(
+                project,
+                &ctx.lez,
+                &ctx.state_path,
+                &ctx.log_path,
+                &ctx.localnet_addr,
+                dry_run,
+                yes,
+                reset_wallet,
+                verify_timeout_sec,
+            )
+        }
     }
 }
 
@@ -727,30 +716,10 @@ fn build_status_report(
 /// deferral, scaffold widens the limit so the documented first-success path
 /// fits in a single block.
 fn prepare_sequencer_config(lez: &Path, dest_dir: &Path, port: u16) -> DynResult<PathBuf> {
-    let src_path = lez.join(SEQUENCER_CONFIG_REL_PATH);
-    let text = fs::read_to_string(&src_path)
-        .with_context(|| format!("failed to read {}", src_path.display()))?;
-    let mut doc: Value =
-        serde_json::from_str(&text).context("failed to parse sequencer_config.json")?;
-
-    let Some(obj) = doc.as_object_mut() else {
-        bail!(
-            "sequencer_config.json is not a JSON object: {}",
-            src_path.display()
-        );
-    };
-    obj.insert("port".to_string(), Value::Number(port.into()));
-    obj.insert(
-        "max_block_size".to_string(),
-        Value::String("8 MiB".to_string()),
-    );
-
-    fs::create_dir_all(dest_dir)
-        .with_context(|| format!("failed to create {}", dest_dir.display()))?;
-    let dest_path = dest_dir.join("sequencer_config.json");
-    let updated = serde_json::to_string_pretty(&doc).context("failed to serialize config")?;
-    fs::write(&dest_path, format!("{updated}\n"))
-        .with_context(|| format!("failed to write {}", dest_path.display()))?;
+    let (dest_path, _) = patch_runtime_sequencer_config(lez, dest_dir, |obj| {
+        apply_common_runtime_overrides(obj, port);
+        Ok(())
+    })?;
     Ok(dest_path)
 }
 
@@ -1162,12 +1131,14 @@ mod tests {
                 pin: String::new(),
                 build: crate::model::RepoBuild::Cargo,
                 attr: String::new(),
+                attr_platform: std::collections::BTreeMap::new(),
                 path: lez_dir.display().to_string(),
             },
             spel: RepoRef::default(),
             basecamp_repo: None,
             lgpm_repo: None,
             wallet_home_dir: ".scaffold/wallet".to_string(),
+            circuits: crate::model::CircuitsConfig::default(),
             framework: FrameworkConfig {
                 kind: String::new(),
                 version: String::new(),
@@ -1362,6 +1333,27 @@ mod tests {
             git_clean(&lez).unwrap(),
             "lez tree must remain clean after prepare_sequencer_config"
         );
+    }
+
+    #[test]
+    fn prepare_sequencer_config_accepts_nested_lez_layout() {
+        let temp = tempdir().unwrap();
+        let lez = temp.path().join("lez");
+        let state_dir = temp.path().join(".scaffold/state");
+
+        // Newer LEZ pins moved the repository payload under a `lez/` prefix.
+        // `localnet start` must find that config instead of only probing the
+        // pre-reorg flat path.
+        let config_path = lez.join("lez/sequencer/service/configs/debug/sequencer_config.json");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&config_path, "{\n  \"port\": 3040\n}\n").unwrap();
+
+        let dest = prepare_sequencer_config(&lez, &state_dir, 4050).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&dest).unwrap()).unwrap();
+
+        assert_eq!(doc["port"], serde_json::json!(4050));
+        assert_eq!(doc["max_block_size"], serde_json::json!("8 MiB"));
     }
 
     #[test]

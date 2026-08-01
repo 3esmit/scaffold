@@ -21,7 +21,24 @@ pub(crate) struct RepoRef {
     pub(crate) pin: String,
     pub(crate) build: RepoBuild,
     pub(crate) attr: String,
+    /// `[repos.<name>.attr]` per-platform map (nix system triple -> flake
+    /// output attribute), e.g. `attr.aarch64-darwin = "bin-macos-app"`. Empty
+    /// when `attr` is given in scalar form; `effective_attr` prefers a matching
+    /// entry here and falls back to the scalar `attr`.
+    pub(crate) attr_platform: std::collections::BTreeMap<String, String>,
     pub(crate) path: String,
+}
+
+impl RepoRef {
+    /// Resolve the flake output attribute for `system` (a nix system triple).
+    /// Prefers a per-platform `attr_platform` entry; falls back to the scalar
+    /// `attr` when the platform isn't mapped (or no map was given).
+    pub(crate) fn effective_attr(&self, system: &str) -> &str {
+        self.attr_platform
+            .get(system)
+            .map(String::as_str)
+            .unwrap_or(self.attr.as_str())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -64,6 +81,23 @@ impl Default for LocalnetConfig {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct CircuitsConfig {
+    pub(crate) version: String,
+    pub(crate) url_template: Option<String>,
+    pub(crate) install_dir: String,
+}
+
+impl Default for CircuitsConfig {
+    fn default() -> Self {
+        Self {
+            version: crate::constants::DEFAULT_CIRCUITS_VERSION.to_string(),
+            url_template: None,
+            install_dir: ".scaffold/circuits".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct Config {
     pub(crate) version: String,
     pub(crate) cache_root: String,
@@ -76,6 +110,7 @@ pub(crate) struct Config {
     /// `[repos.lgpm]`. Optional, same reasoning as `basecamp_repo`.
     pub(crate) lgpm_repo: Option<RepoRef>,
     pub(crate) wallet_home_dir: String,
+    pub(crate) circuits: CircuitsConfig,
     pub(crate) framework: FrameworkConfig,
     pub(crate) localnet: LocalnetConfig,
     /// `[modules.<name>]` — top-level Logos module catalog (was
@@ -103,6 +138,10 @@ pub(crate) enum ModuleRole {
 pub(crate) struct ModuleEntry {
     pub(crate) flake: String,
     pub(crate) role: ModuleRole,
+    /// `[modules.<name>].standalone_app` — optional flake app attr that
+    /// `basecamp run --host standalone` invokes via `nix run <flake>#<attr>`.
+    /// `None` runs the flake's default app (`apps.<system>.default`).
+    pub(crate) standalone_app: Option<String>,
 }
 
 /// `[basecamp]` runtime config only. Pin and source moved to
@@ -119,10 +158,9 @@ pub(crate) struct BasecampConfig {
     /// appended onto the value `lgs` inherited at launch time (so basecamp's
     /// own paths aren't clobbered). Applied before `env`.
     pub(crate) env_append: std::collections::BTreeMap<String, Vec<String>>,
-    /// `[basecamp.profiles.<name>.env]` — per-profile plain env. Wins over the
-    /// global `[basecamp.env]` for the launched profile.
-    pub(crate) profile_env:
-        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    /// `[basecamp.profiles.<name>]` — per-profile launch config, keyed by an
+    /// arbitrary profile name (no alice/bob gate).
+    pub(crate) profiles: std::collections::BTreeMap<String, BasecampProfile>,
 }
 
 impl Default for BasecampConfig {
@@ -132,9 +170,27 @@ impl Default for BasecampConfig {
             port_stride: 10,
             env: std::collections::BTreeMap::new(),
             env_append: std::collections::BTreeMap::new(),
-            profile_env: std::collections::BTreeMap::new(),
+            profiles: std::collections::BTreeMap::new(),
         }
     }
+}
+
+/// `[basecamp.profiles.<name>]` — per-profile launch configuration.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BasecampProfile {
+    /// `.env` — per-profile plain env (replace semantics). Wins over the
+    /// global `[basecamp.env]` for the launched profile.
+    pub(crate) env: std::collections::BTreeMap<String, String>,
+    /// `.env_file` — path (project-relative or absolute) to a dotenv-style
+    /// `KEY=VALUE` file sourced before the `env` layers override it.
+    pub(crate) env_file: Option<String>,
+    /// `.runtime_dir` — short `TMPDIR`/`XDG_RUNTIME_DIR` root, to dodge the
+    /// macOS `sun_path == 104` Unix-socket path limit. Project-relative or
+    /// absolute; defaults to `/tmp/lgs-<profile>` on macOS when unset.
+    pub(crate) runtime_dir: Option<String>,
+    /// `.log_file` — tee basecamp's stdout/stderr to this file on launch
+    /// (project-relative or absolute). Overridden by `launch --log-file`.
+    pub(crate) log_file: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -287,7 +343,7 @@ pub(crate) struct FrameworkIdlConfig {
     pub(crate) path: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RunProfile {
     /// Wipe rocksdb + wallet, restart sequencer, re-seed default wallet.
     /// Broader than `lgs localnet reset`: re-establishes the documented
@@ -296,6 +352,28 @@ pub(crate) struct RunProfile {
     /// deterministic test suites where PDA-key collisions force a wipe.
     pub(crate) reset: bool,
     pub(crate) post_deploy: Vec<String>,
+    /// Whether `lgs run` performs its own deploy step. Defaults to `true`.
+    /// Set `deploy = false` for a project that owns program deployment
+    /// itself (e.g. deploys from a `post_deploy` hook, or keeps its guest
+    /// program outside the scaffold-default `methods/guest/src/bin`): the
+    /// pipeline then skips step 5's hash/deploy/save-state and goes straight
+    /// to the post-deploy hooks, instead of bailing on the missing default
+    /// program directory.
+    pub(crate) deploy: bool,
+}
+
+impl Default for RunProfile {
+    fn default() -> Self {
+        // `deploy` defaults to `true` so a project with no `[run]` config (or a
+        // profile that omits the key) keeps the historical behavior of running
+        // scaffold's deploy step. `derive(Default)` would give `false`, which
+        // would silently disable deploy for every existing project.
+        Self {
+            reset: false,
+            post_deploy: Vec::new(),
+            deploy: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]

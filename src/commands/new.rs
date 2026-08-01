@@ -181,6 +181,7 @@ fn cmd_new_inner(cmd: &NewCommand, target: &Path, template_variant: &str) -> Dyn
         basecamp_repo: Some(default_basecamp_repo(DEFAULT_BASECAMP_PIN)),
         lgpm_repo: Some(default_lgpm_repo(DEFAULT_LGPM_PIN)),
         wallet_home_dir: ".scaffold/wallet".to_string(),
+        circuits: crate::model::CircuitsConfig::default(),
         framework: FrameworkConfig {
             kind: template_variant.to_string(),
             version: DEFAULT_FRAMEWORK_VERSION.to_string(),
@@ -207,6 +208,8 @@ fn cmd_new_inner(cmd: &NewCommand, target: &Path, template_variant: &str) -> Dyn
     let overlay_ctx = OverlayRenderContext {
         crate_name: &crate_name,
         lez_pin: &cfg.lez.pin,
+        lez_tag: DEFAULT_LEZ.tag,
+        spel_pin: &cfg.spel.pin,
     };
     apply_overlay(target, template_variant, &overlay_ctx)?;
     if template_variant == FRAMEWORK_KIND_LEZ_FRAMEWORK {
