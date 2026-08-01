@@ -110,7 +110,7 @@ enum Commands {
         long_about = "Forward arguments to the project-vendored `spel` binary.\n\n\
                       Use the form: `logos-scaffold spel -- <spel-subcommand...>`\n\n\
                       Examples:\n  \
-                      logos-scaffold spel -- inspect path/to/program.bin\n  \
+                      logos-scaffold spel -- program-id path/to/program.bin\n  \
                       logos-scaffold spel -- generate-idl"
     )]
     Spel(SpelArgs),
@@ -765,9 +765,6 @@ struct TestNodePinsArgs {
     /// Override the LEZ ref (SHA, tag, or branch).
     #[arg(long, value_name = "REF")]
     lez_ref: Option<String>,
-    /// Override the circuits release version.
-    #[arg(long, value_name = "VER")]
-    circuits_version: Option<String>,
     #[arg(long)]
     json: bool,
 }
@@ -777,7 +774,7 @@ struct TestNodePrepareArgs {
     /// Project root (default: discover from the current directory).
     #[arg(long, value_name = "DIR")]
     project: Option<PathBuf>,
-    /// Override the cache root used for managed checkouts and circuits.
+    /// Override the cache root used for managed LEZ checkouts.
     #[arg(long, value_name = "DIR")]
     cache_root: Option<PathBuf>,
     /// Override the LEZ source (clone URL or local checkout directory).
@@ -787,9 +784,6 @@ struct TestNodePrepareArgs {
     /// Override the LEZ ref (SHA, tag, or branch).
     #[arg(long, value_name = "REF")]
     lez_ref: Option<String>,
-    /// Override the circuits release version.
-    #[arg(long, value_name = "VER")]
-    circuits_version: Option<String>,
     #[arg(long)]
     json: bool,
 }
@@ -823,8 +817,32 @@ struct TestNodeStartArgs {
     /// Seconds to wait for the node to become healthy.
     #[arg(long, default_value_t = crate::testnode::DEFAULT_TEST_NODE_TIMEOUT_SEC)]
     timeout_sec: u64,
+    #[command(flatten)]
+    block_timing: BlockTimingArgs,
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct BlockTimingArgs {
+    /// Override sequencer block_create_timeout in milliseconds.
+    #[arg(
+        long,
+        value_name = "MS",
+        value_parser = clap::value_parser!(u64).range(
+            crate::testnode::MIN_BLOCK_TIMING_TIMEOUT_MS..=crate::testnode::MAX_BLOCK_TIMING_TIMEOUT_MS
+        )
+    )]
+    block_create_timeout_ms: Option<u64>,
+    /// Override sequencer retry_pending_blocks_timeout in milliseconds.
+    #[arg(
+        long,
+        value_name = "MS",
+        value_parser = clap::value_parser!(u64).range(
+            crate::testnode::MIN_BLOCK_TIMING_TIMEOUT_MS..=crate::testnode::MAX_BLOCK_TIMING_TIMEOUT_MS
+        )
+    )]
+    retry_pending_blocks_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -869,6 +887,8 @@ struct TestNodeRunArgs {
     /// Seconds to wait for the node to become healthy before running the command.
     #[arg(long, default_value_t = crate::testnode::DEFAULT_TEST_NODE_TIMEOUT_SEC)]
     timeout_sec: u64,
+    #[command(flatten)]
+    block_timing: BlockTimingArgs,
     /// Command (after `--`) to run with the node's connection exported.
     #[arg(last = true, required = true)]
     command: Vec<String>,
@@ -1033,14 +1053,26 @@ enum BasecampSubcommand {
     )]
     Develop(BasecampDevelopArgs),
     #[command(
+        about = "Build the project's .lgx artefacts for a flake variant (lgx/lgx-portable/all) without installing them. See `basecamp docs` for project requirements."
+    )]
+    Build(BasecampBuildArgs),
+    #[command(
         name = "build-portable",
-        about = "Build the project's .#lgx-portable artefacts for hand-loading into a basecamp AppImage. See `basecamp docs` for project requirements."
+        about = "Build the project's .#lgx-portable artefacts for hand-loading into a basecamp AppImage (alias for `build --variant lgx-portable`). See `basecamp docs` for project requirements."
     )]
     BuildPortable(BasecampBuildPortableArgs),
+    #[command(
+        about = "Run a captured module via `nix run` — its standalone app. See `basecamp docs` for project requirements."
+    )]
+    Run(BasecampRunArgs),
     #[command(
         about = "Basecamp-specific doctor: captured modules, manifest variants, and state drift. See `basecamp docs` for project requirements."
     )]
     Doctor(BasecampDoctorArgs),
+    #[command(
+        about = "Print the resolved per-profile path manifest (xdg dirs, runtime dir, module/plugin dirs, log file)."
+    )]
+    Paths(BasecampPathsArgs),
     #[command(
         about = "Print the canonical project-compatibility rules (embedded copy of docs/basecamp-module-requirements.md)"
     )]
@@ -1066,11 +1098,48 @@ struct BasecampModulesArgs {
     show: bool,
 }
 
+/// Flake output variant(s) `basecamp build` resolves against per module.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum BuildVariant {
+    /// `#lgx` — the dev artefact (same output `install` builds).
+    Lgx,
+    /// `#lgx-portable` — for hand-loading into a basecamp AppImage.
+    #[value(name = "lgx-portable")]
+    LgxPortable,
+    /// Both `lgx` and `lgx-portable`.
+    All,
+}
+
+impl BuildVariant {
+    /// Flake attr names this selection expands to (build order).
+    fn attrs(self) -> Vec<String> {
+        match self {
+            Self::Lgx => vec!["lgx".to_string()],
+            Self::LgxPortable => vec!["lgx-portable".to_string()],
+            Self::All => vec!["lgx".to_string(), "lgx-portable".to_string()],
+        }
+    }
+}
+
+#[derive(Debug, clap::Args)]
+struct BasecampBuildArgs {
+    /// Flake variant(s) to build. Defaults to `all` (both `lgx` and
+    /// `lgx-portable`), per #174.
+    #[arg(long, value_enum, default_value_t = BuildVariant::All)]
+    variant: BuildVariant,
+    /// Restrict the build to a single captured project module.
+    #[arg(long, value_name = "NAME")]
+    module: Option<String>,
+}
+
 #[derive(Debug, clap::Args)]
 struct BasecampBuildPortableArgs {
-    // `build-portable` takes no CLI source flags: it attr-swaps
-    // `state.project_sources` (`#lgx` → `#lgx-portable`) and builds that.
-    // `state.dependencies` are ignored — the target AppImage provides them.
+    // `build-portable` is the alias for `build --variant lgx-portable`. It
+    // attr-swaps `#lgx` → `#lgx-portable` and builds that; `role = dependency`
+    // modules are ignored — the target AppImage provides them.
+    /// Restrict the build to a single captured project module.
+    #[arg(long, value_name = "NAME")]
+    module: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1089,6 +1158,19 @@ struct BasecampInstallArgs {
 struct BasecampLaunchArgs {
     #[arg(value_name = "PROFILE")]
     profile: String,
+    /// Tee basecamp's stdout/stderr to a log file. Bare `--log-file` uses
+    /// `.scaffold/basecamp/profiles/<profile>/basecamp.log`; `--log-file=PATH`
+    /// picks a path. Overrides `[basecamp.profiles.<profile>].log_file`.
+    #[arg(long, value_name = "PATH", num_args = 0..=1, require_equals = true)]
+    log_file: Option<Option<PathBuf>>,
+}
+
+#[derive(Debug, clap::Args)]
+struct BasecampPathsArgs {
+    #[arg(value_name = "PROFILE")]
+    profile: String,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1100,6 +1182,27 @@ struct BasecampDevelopArgs {
     /// to the flake's default dev shell.
     #[arg(long, value_name = "ATTR")]
     dev_shell: Option<String>,
+}
+
+/// How `basecamp run` runs a module. `standalone` (the module's own app) is
+/// the only host today; running a module as a configured Basecamp peer is
+/// tracked as separate follow-up work, so this stays an enum for that future.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum RunHost {
+    /// The module's own app: `nix run <flake>` (the flake's
+    /// `apps.<system>.default`), or `#<standalone_app>` when configured.
+    Standalone,
+}
+
+#[derive(Debug, clap::Args)]
+struct BasecampRunArgs {
+    /// Name of the module to run, keyed in `[modules.<name>]`.
+    #[arg(value_name = "MODULE")]
+    module: String,
+    /// How to run the module. `standalone` (the module's own app) is the only
+    /// host today and the default when omitted.
+    #[arg(long, value_enum)]
+    host: Option<RunHost>,
 }
 
 pub(crate) fn run(args: Vec<String>) -> DynResult<()> {
@@ -1197,7 +1300,6 @@ pub(crate) fn run(args: Vec<String>) -> DynResult<()> {
                     overrides: crate::testnode::pins::PinOverrides {
                         lez_source: args.lez_source,
                         lez_ref: args.lez_ref,
-                        circuits_version: args.circuits_version,
                     },
                     json: args.json,
                 },
@@ -1206,7 +1308,6 @@ pub(crate) fn run(args: Vec<String>) -> DynResult<()> {
                     overrides: crate::testnode::pins::PinOverrides {
                         lez_source: args.lez_source,
                         lez_ref: args.lez_ref,
-                        circuits_version: args.circuits_version,
                     },
                     cache_root: args.cache_root,
                     json: args.json,
@@ -1222,6 +1323,12 @@ pub(crate) fn run(args: Vec<String>) -> DynResult<()> {
                     work_dir: args.work_dir,
                     preserve_work_dir: args.preserve_work_dir,
                     timeout_sec: args.timeout_sec,
+                    block_timing: crate::testnode::BlockTimingOverrides {
+                        block_create_timeout_ms: args.block_timing.block_create_timeout_ms,
+                        retry_pending_blocks_timeout_ms: args
+                            .block_timing
+                            .retry_pending_blocks_timeout_ms,
+                    },
                     json: args.json,
                 },
                 TestNodeSubcommand::Status(args) => TestNodeAction::Status {
@@ -1240,6 +1347,12 @@ pub(crate) fn run(args: Vec<String>) -> DynResult<()> {
                     serial: args.serial,
                     parallel: args.parallel,
                     timeout_sec: args.timeout_sec,
+                    block_timing: crate::testnode::BlockTimingOverrides {
+                        block_create_timeout_ms: args.block_timing.block_create_timeout_ms,
+                        retry_pending_blocks_timeout_ms: args
+                            .block_timing
+                            .retry_pending_blocks_timeout_ms,
+                    },
                     command: args.command,
                 },
                 TestNodeSubcommand::Tx(tx) => match tx.command {
@@ -1399,13 +1512,31 @@ pub(crate) fn run(args: Vec<String>) -> DynResult<()> {
                 },
                 BasecampSubcommand::Launch(args) => BasecampAction::Launch {
                     profile: args.profile,
+                    log_file: args.log_file,
                 },
                 BasecampSubcommand::Develop(args) => BasecampAction::Develop {
                     module: args.module,
                     dev_shell: args.dev_shell,
                 },
-                BasecampSubcommand::BuildPortable(_) => BasecampAction::BuildPortable,
+                BasecampSubcommand::Build(args) => BasecampAction::Build {
+                    variants: args.variant.attrs(),
+                    module: args.module,
+                },
+                BasecampSubcommand::BuildPortable(args) => BasecampAction::Build {
+                    variants: vec!["lgx-portable".to_string()],
+                    module: args.module,
+                },
+                BasecampSubcommand::Run(args) => BasecampAction::Run {
+                    module: args.module,
+                    host: args.host.map(|h| match h {
+                        RunHost::Standalone => "standalone".to_string(),
+                    }),
+                },
                 BasecampSubcommand::Doctor(args) => BasecampAction::Doctor { json: args.json },
+                BasecampSubcommand::Paths(args) => BasecampAction::Paths {
+                    profile: args.profile,
+                    json: args.json,
+                },
                 BasecampSubcommand::Docs => BasecampAction::Docs,
             };
             cmd_basecamp(action)
@@ -1548,7 +1679,7 @@ fn spel_passthrough_args(args: &[String], start: usize) -> DynResult<Option<Vec<
     let (sep_idx, quiet_seen) = skip_inline_quiet(args, start + 1);
     if args.len() <= sep_idx {
         return Err(anyhow!(
-            "`spel` requires arguments. Use the passthrough form, e.g. `logos-scaffold spel -- inspect <bin>`."
+            "`spel` requires arguments. Use the passthrough form, e.g. `logos-scaffold spel -- program-id <bin>`."
         ));
     }
     if args[sep_idx] != "--" {
@@ -1560,7 +1691,7 @@ fn spel_passthrough_args(args: &[String], start: usize) -> DynResult<Option<Vec<
     }
     if args.len() == sep_idx + 1 {
         return Err(anyhow!(
-            "spel passthrough requires at least one argument after `--`. Example: `logos-scaffold spel -- inspect <bin>`"
+            "spel passthrough requires at least one argument after `--`. Example: `logos-scaffold spel -- program-id <bin>`"
         ));
     }
     if quiet_seen {
@@ -1620,4 +1751,25 @@ fn require_address(
             "{context} requires an address. Examples: `logos-scaffold wallet default set <address>` or `logos-scaffold wallet default set --address <address>`."
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BuildVariant;
+
+    #[test]
+    fn build_variant_all_expands_to_both_variants_in_build_order() {
+        // `--variant all` must build BOTH `#lgx` and `#lgx-portable`, in that
+        // order (lgx first), so `cmd_basecamp_build`'s per-variant loop runs
+        // each pass. The single-variant forms select exactly one attr.
+        assert_eq!(BuildVariant::Lgx.attrs(), vec!["lgx".to_string()]);
+        assert_eq!(
+            BuildVariant::LgxPortable.attrs(),
+            vec!["lgx-portable".to_string()]
+        );
+        assert_eq!(
+            BuildVariant::All.attrs(),
+            vec!["lgx".to_string(), "lgx-portable".to_string()]
+        );
+    }
 }

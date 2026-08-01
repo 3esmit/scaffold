@@ -15,6 +15,15 @@ use predicates::prelude::*;
 use tar::Archive;
 use tempfile::tempdir;
 
+#[cfg(unix)]
+mod common;
+
+#[cfg(unix)]
+use common::test_node::{
+    assert_test_node_launched_with_config, setup_test_node_project, test_node_observed_config_path,
+    TestNodeFixtures,
+};
+
 const TEST_PIN: &str = "767b5afd388c7981bcdf6f5b5c80159607e07e5b";
 const VALID_ACCOUNT_ID: &str = "6iArKUXxhUJqS7kCaPNhwMWt3ro71PDyBj7jwAyE2VQV";
 const VALID_PUBLIC_ADDRESS: &str = "Public/6iArKUXxhUJqS7kCaPNhwMWt3ro71PDyBj7jwAyE2VQV";
@@ -1187,6 +1196,218 @@ fn localnet_start_patches_config_and_uses_configured_port() {
     assert_eq!(env, "0", "expected risc0 dev mode override to be passed");
 }
 
+#[cfg(unix)]
+#[test]
+fn test_node_start_patches_block_timing_flags() {
+    let temp = tempdir().expect("tempdir");
+    let fixtures = setup_test_node_project(temp.path());
+    let work_dir = temp.path().join("node-work");
+
+    let runtime_json = start_test_node_and_read_runtime_config(
+        temp.path(),
+        &fixtures,
+        &work_dir,
+        &[
+            "--block-create-timeout-ms",
+            "100",
+            "--retry-pending-blocks-timeout-ms",
+            "250",
+        ],
+    );
+    assert_eq!(
+        runtime_json["block_create_timeout"],
+        serde_json::json!("100ms")
+    );
+    assert_eq!(
+        runtime_json["retry_pending_blocks_timeout"],
+        serde_json::json!("250ms")
+    );
+
+    assert_vendored_test_node_timing_preserved(&fixtures);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_node_start_preserves_block_timing_without_flags() {
+    let temp = tempdir().expect("tempdir");
+    let fixtures = setup_test_node_project(temp.path());
+    let work_dir = temp.path().join("node-work");
+
+    let runtime_json =
+        start_test_node_and_read_runtime_config(temp.path(), &fixtures, &work_dir, &[]);
+    assert_eq!(
+        runtime_json["block_create_timeout"],
+        serde_json::json!("2s")
+    );
+    assert_eq!(
+        runtime_json["retry_pending_blocks_timeout"],
+        serde_json::json!("3s")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_node_start_preserves_unset_block_timing_field() {
+    let temp = tempdir().expect("tempdir");
+    let fixtures = setup_test_node_project(temp.path());
+    let work_dir = temp.path().join("node-work");
+
+    let runtime_json = start_test_node_and_read_runtime_config(
+        temp.path(),
+        &fixtures,
+        &work_dir,
+        &["--block-create-timeout-ms", "100"],
+    );
+    assert_eq!(
+        runtime_json["block_create_timeout"],
+        serde_json::json!("100ms")
+    );
+    assert_eq!(
+        runtime_json["retry_pending_blocks_timeout"],
+        serde_json::json!("3s")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_node_run_patches_block_timing_flags_for_child_command() {
+    let temp = tempdir().expect("tempdir");
+    let fixtures = setup_test_node_project(temp.path());
+
+    let observed_json = run_test_node_and_observe_config(
+        temp.path(),
+        &fixtures,
+        &[
+            "--block-create-timeout-ms",
+            "101",
+            "--retry-pending-blocks-timeout-ms",
+            "251",
+        ],
+    );
+    assert_eq!(
+        observed_json["block_create_timeout"],
+        serde_json::json!("101ms")
+    );
+    assert_eq!(
+        observed_json["retry_pending_blocks_timeout"],
+        serde_json::json!("251ms")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_node_run_preserves_block_timing_without_flags_for_child_command() {
+    let temp = tempdir().expect("tempdir");
+    let fixtures = setup_test_node_project(temp.path());
+
+    let observed_json = run_test_node_and_observe_config(temp.path(), &fixtures, &[]);
+    assert_eq!(
+        observed_json["block_create_timeout"],
+        serde_json::json!("2s")
+    );
+    assert_eq!(
+        observed_json["retry_pending_blocks_timeout"],
+        serde_json::json!("3s")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_node_run_preserves_unset_block_timing_field_for_child_command() {
+    let temp = tempdir().expect("tempdir");
+    let fixtures = setup_test_node_project(temp.path());
+
+    let observed_json = run_test_node_and_observe_config(
+        temp.path(),
+        &fixtures,
+        &["--retry-pending-blocks-timeout-ms", "251"],
+    );
+    assert_eq!(
+        observed_json["block_create_timeout"],
+        serde_json::json!("2s")
+    );
+    assert_eq!(
+        observed_json["retry_pending_blocks_timeout"],
+        serde_json::json!("251ms")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_node_run_forwards_child_exit_status_with_block_timing_flags() {
+    let temp = tempdir().expect("tempdir");
+    let fixtures = setup_test_node_project(temp.path());
+
+    Command::new(assert_cmd::cargo::cargo_bin!("logos-scaffold"))
+        .current_dir(temp.path())
+        .env("LOGOS_BLOCKCHAIN_CIRCUITS", &fixtures.circuits_path)
+        .arg("test-node")
+        .arg("run")
+        .arg("--block-create-timeout-ms")
+        .arg("100")
+        .arg("--retry-pending-blocks-timeout-ms")
+        .arg("100")
+        .arg("--timeout-sec")
+        .arg("5")
+        .arg("--")
+        .arg(&fixtures.python_path)
+        .arg("-c")
+        .arg("import sys; sys.exit(7)")
+        .assert()
+        .code(7);
+}
+
+#[test]
+fn test_node_timing_flags_reject_duration_suffixes() {
+    for subcommand in ["start", "run"] {
+        for flag in [
+            "--block-create-timeout-ms",
+            "--retry-pending-blocks-timeout-ms",
+        ] {
+            for value in ["100ms", "1s", "1m", "1h"] {
+                let mut command = Command::new(assert_cmd::cargo::cargo_bin!("logos-scaffold"));
+                command
+                    .arg("test-node")
+                    .arg(subcommand)
+                    .arg(flag)
+                    .arg(value);
+                if subcommand == "run" {
+                    command.arg("--").arg("not-executed");
+                }
+                command
+                    .assert()
+                    .failure()
+                    .stderr(predicate::str::contains(flag));
+            }
+        }
+    }
+}
+
+#[test]
+fn test_node_timing_flags_reject_out_of_range_milliseconds() {
+    Command::new(assert_cmd::cargo::cargo_bin!("logos-scaffold"))
+        .arg("test-node")
+        .arg("start")
+        .arg("--block-create-timeout-ms")
+        .arg("0")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--block-create-timeout-ms"));
+
+    Command::new(assert_cmd::cargo::cargo_bin!("logos-scaffold"))
+        .arg("test-node")
+        .arg("run")
+        .arg("--retry-pending-blocks-timeout-ms")
+        .arg("3600001")
+        .arg("--")
+        .arg("not-executed")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--retry-pending-blocks-timeout-ms",
+        ));
+}
+
 #[test]
 fn localnet_stop_outside_project_succeeds() {
     let temp = tempdir().expect("tempdir");
@@ -2063,6 +2284,47 @@ fn deploy_plain_output_has_single_program_id_line_per_program() {
 }
 
 #[test]
+fn deploy_aborts_remaining_programs_when_head_stalls() {
+    // PR #241 review: a pacing timeout must gate the next submission.
+    // Continuing unpaced after a stalled head can batch the remaining ELFs
+    // into one block and recreate the fatal oversized-inscription sequencer
+    // crash, so the deploy aborts fail-closed: first program submitted,
+    // every remaining program marked failed, non-zero exit.
+    let temp = tempdir().expect("tempdir");
+    let rpc = RpcStub::start_stalled();
+    setup_wallet_project(temp.path(), Some(&rpc.url));
+    write_guest_program(temp.path(), "alpha");
+    write_guest_program(temp.path(), "beta");
+    write_guest_binary(temp.path(), "alpha");
+    write_guest_binary(temp.path(), "beta");
+
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("logos-scaffold"))
+        .current_dir(temp.path())
+        .env("LOGOS_SCAFFOLD_DEPLOY_PACING_TIMEOUT_MS", "200")
+        .arg("deploy")
+        .output()
+        .expect("run deploy against a stalled head");
+
+    assert!(
+        !output.status.success(),
+        "a pacing abort must exit non-zero"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("OK  alpha submitted"),
+        "first program must be submitted before the stall is detected:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("FAIL beta not submitted") && stdout.contains("deploy pacing aborted"),
+        "remaining program must be aborted fail-closed, not submitted unpaced:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Succeeded: 1") && stdout.contains("Failed: 1"),
+        "summary must reflect one submitted + one aborted program:\n{stdout}"
+    );
+}
+
+#[test]
 fn deploy_program_path_json_includes_program_id() {
     let temp = tempdir().expect("tempdir");
     let rpc = RpcStub::start();
@@ -2374,7 +2636,7 @@ fn spel_proxy_forwards_args_to_vendored_binary() {
         .current_dir(temp.path())
         .arg("spel")
         .arg("--")
-        .arg("inspect")
+        .arg("program-id")
         .arg("methods/guest/foo.bin")
         .assert()
         .success()
@@ -2396,7 +2658,7 @@ fn spel_proxy_works_with_leading_quiet_flag() {
         .arg("--quiet")
         .arg("spel")
         .arg("--")
-        .arg("inspect")
+        .arg("program-id")
         .arg("methods/guest/foo.bin")
         .assert()
         .success()
@@ -2407,7 +2669,7 @@ fn spel_proxy_works_with_leading_quiet_flag() {
         .arg("-q")
         .arg("spel")
         .arg("--")
-        .arg("inspect")
+        .arg("program-id")
         .arg("methods/guest/foo.bin")
         .assert()
         .success();
@@ -2427,7 +2689,7 @@ fn spel_proxy_accepts_quiet_between_subcommand_and_separator() {
         .arg("spel")
         .arg("-q")
         .arg("--")
-        .arg("inspect")
+        .arg("program-id")
         .arg("methods/guest/foo.bin")
         .assert()
         .success()
@@ -2443,7 +2705,7 @@ fn spel_proxy_accepts_quiet_between_subcommand_and_separator() {
         .arg("spel")
         .arg("--quiet")
         .arg("--")
-        .arg("inspect")
+        .arg("program-id")
         .arg("methods/guest/foo.bin")
         .assert()
         .success();
@@ -2459,7 +2721,7 @@ fn spel_proxy_forwards_nonzero_exit_code() {
         .env("SPEL_FAIL", "1")
         .arg("spel")
         .arg("--")
-        .arg("inspect")
+        .arg("program-id")
         .arg("foo.bin")
         .assert()
         .failure();
@@ -2475,7 +2737,7 @@ fn spel_proxy_hints_when_binary_missing() {
         .current_dir(temp.path())
         .arg("spel")
         .arg("--")
-        .arg("inspect")
+        .arg("program-id")
         .arg("foo.bin")
         .assert()
         .failure()
@@ -2506,13 +2768,14 @@ fn spel_without_dash_dash_suggests_passthrough_form() {
     Command::new(assert_cmd::cargo::cargo_bin!("logos-scaffold"))
         .current_dir(temp.path())
         .arg("spel")
-        .arg("inspect")
+        .arg("program-id")
         .arg("foo.bin")
         .assert()
         .failure()
         .stderr(
-            predicate::str::contains("Did you mean")
-                .and(predicate::str::contains("logos-scaffold spel -- inspect")),
+            predicate::str::contains("Did you mean").and(predicate::str::contains(
+                "logos-scaffold spel -- program-id",
+            )),
         );
 }
 
@@ -2631,6 +2894,65 @@ fn basecamp_develop_unknown_module_errors_with_known_list() {
     Command::new(assert_cmd::cargo::cargo_bin!("logos-scaffold"))
         .current_dir(temp.path())
         .args(["basecamp", "develop", "nonexistent"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("no module `nonexistent`")
+                .and(predicate::str::contains("swap_module")),
+        );
+}
+
+#[test]
+fn basecamp_build_without_captured_modules_errors_before_nix() {
+    // The empty-modules guard runs before the `nix` presence check, so this is
+    // deterministic in CI: `build` never discovers, it only builds captured
+    // project sources.
+    let temp = tempdir().expect("tempdir");
+    fs::write(temp.path().join("scaffold.toml"), MINIMAL_SCAFFOLD_TOML)
+        .expect("write scaffold.toml");
+
+    Command::new(assert_cmd::cargo::cargo_bin!("logos-scaffold"))
+        .current_dir(temp.path())
+        .args(["basecamp", "build"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no project modules captured"));
+}
+
+#[test]
+fn basecamp_build_unknown_module_errors_with_project_list() {
+    // The `--module` filter is validated before the `nix` presence check, so
+    // an unknown name fails fast and lists the captured project modules.
+    let temp = tempdir().expect("tempdir");
+    let toml = format!(
+        "{MINIMAL_SCAFFOLD_TOML}\n[modules.swap_module]\nflake = \"github:logos-co/swap-module#lgx\"\nrole = \"project\"\n"
+    );
+    fs::write(temp.path().join("scaffold.toml"), toml).expect("write scaffold.toml");
+
+    Command::new(assert_cmd::cargo::cargo_bin!("logos-scaffold"))
+        .current_dir(temp.path())
+        .args(["basecamp", "build", "--module", "nonexistent"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("no project module `nonexistent`")
+                .and(predicate::str::contains("swap_module")),
+        );
+}
+
+#[test]
+fn basecamp_run_unknown_module_errors_with_known_list() {
+    // `run`'s module lookup runs before the `nix` presence check (mirrors
+    // `develop`), so an unknown module name is deterministic in CI.
+    let temp = tempdir().expect("tempdir");
+    let toml = format!(
+        "{MINIMAL_SCAFFOLD_TOML}\n[modules.swap_module]\nflake = \"github:logos-co/swap-module#lgx\"\nrole = \"project\"\n"
+    );
+    fs::write(temp.path().join("scaffold.toml"), toml).expect("write scaffold.toml");
+
+    Command::new(assert_cmd::cargo::cargo_bin!("logos-scaffold"))
+        .current_dir(temp.path())
+        .args(["basecamp", "run", "nonexistent"])
         .assert()
         .failure()
         .stderr(
@@ -2944,13 +3266,14 @@ fn basecamp_launch_setup_hint_takes_precedence_over_profile_validation() {
 
 #[cfg(unix)]
 #[test]
-fn basecamp_launch_rejects_unknown_profile() {
+fn basecamp_launch_accepts_custom_profile_name() {
     let temp = tempdir().expect("tempdir");
     let project = temp.path();
     fs::write(project.join("scaffold.toml"), MINIMAL_SCAFFOLD_TOML).expect("write scaffold.toml");
 
-    // Fake a completed setup so we get past the first gate and reach profile
-    // validation. Launch never reaches `exec` because the profile check fails first.
+    // Fake a completed setup so we get past the first gate. A custom profile
+    // name (not alice/bob) is now accepted: launch advances to the
+    // modules-captured check instead of rejecting the name outright.
     let state_dir = project.join(".scaffold/state");
     fs::create_dir_all(&state_dir).expect("mkdir state");
     fs::write(state_dir.join("basecamp.state"), fake_basecamp_state()).expect("write state");
@@ -2962,7 +3285,11 @@ fn basecamp_launch_rejects_unknown_profile() {
         .arg("charlie")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unknown profile `charlie`"));
+        .stderr(
+            predicate::str::contains("unknown profile")
+                .not()
+                .and(predicate::str::contains("no modules captured")),
+        );
 }
 
 #[cfg(unix)]
@@ -3094,6 +3421,177 @@ fn write_scaffold_toml(project_root: &Path, lez_path: &Path) {
     write_scaffold_toml_with_localnet(project_root, lez_path, None, None);
 }
 
+#[cfg(unix)]
+fn start_test_node_and_read_runtime_config(
+    project_root: &Path,
+    fixtures: &TestNodeFixtures,
+    work_dir: &Path,
+    extra_args: &[&str],
+) -> serde_json::Value {
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("logos-scaffold"));
+    command
+        .current_dir(project_root)
+        .env("LOGOS_BLOCKCHAIN_CIRCUITS", &fixtures.circuits_path)
+        .arg("test-node")
+        .arg("start")
+        .arg("--work-dir")
+        .arg(work_dir)
+        .arg("--preserve-work-dir");
+    command.args(extra_args);
+    command
+        .arg("--timeout-sec")
+        .arg("5")
+        .arg("--json")
+        .assert()
+        .success();
+
+    TestNodeStopGuard::new(project_root, work_dir, true).stop();
+
+    let runtime_config_path = work_dir.join("sequencer_config.json");
+    assert_test_node_launched_with_config(
+        &fixtures.sequencer_observation_path,
+        &runtime_config_path,
+    );
+    let runtime_config =
+        fs::read_to_string(&runtime_config_path).expect("read runtime sequencer config");
+    serde_json::from_str(&runtime_config).expect("parse runtime sequencer config")
+}
+
+#[cfg(unix)]
+fn run_test_node_and_observe_config(
+    project_root: &Path,
+    fixtures: &TestNodeFixtures,
+    extra_args: &[&str],
+) -> serde_json::Value {
+    let observed_path = project_root.join("observed-config.json");
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("logos-scaffold"));
+    command
+        .current_dir(project_root)
+        .env("LOGOS_BLOCKCHAIN_CIRCUITS", &fixtures.circuits_path)
+        .arg("test-node")
+        .arg("run");
+    command.args(extra_args);
+    command
+        .arg("--timeout-sec")
+        .arg("5")
+        .arg("--")
+        .arg(&fixtures.python_path)
+        .arg("-c")
+        .arg(
+            "import json, os, sys\n\
+             cfg = json.load(open(os.environ['LGS_TEST_NODE_CONFIG_PATH'], encoding='utf-8'))\n\
+             json.dump({\n\
+                 'config_path': os.environ['LGS_TEST_NODE_CONFIG_PATH'],\n\
+                 'block_create_timeout': cfg.get('block_create_timeout'),\n\
+                 'retry_pending_blocks_timeout': cfg.get('retry_pending_blocks_timeout'),\n\
+             }, open(sys.argv[1], 'w', encoding='utf-8'))\n",
+        )
+        .arg(&observed_path)
+        .assert()
+        .success();
+
+    let observed = fs::read_to_string(&observed_path).expect("read observed config");
+    let observed_json: serde_json::Value =
+        serde_json::from_str(&observed).expect("parse observed config");
+    let sequencer_config_path =
+        test_node_observed_config_path(&fixtures.sequencer_observation_path);
+    assert_eq!(
+        observed_json["config_path"],
+        serde_json::json!(sequencer_config_path.display().to_string())
+    );
+    observed_json
+}
+
+#[cfg(unix)]
+fn assert_vendored_test_node_timing_preserved(fixtures: &TestNodeFixtures) {
+    let vendored_config =
+        fs::read_to_string(&fixtures.config_path).expect("read vendored sequencer config");
+    let vendored_json: serde_json::Value =
+        serde_json::from_str(&vendored_config).expect("parse vendored sequencer config");
+    assert_eq!(
+        vendored_json["block_create_timeout"],
+        serde_json::json!("2s")
+    );
+    assert_eq!(
+        vendored_json["retry_pending_blocks_timeout"],
+        serde_json::json!("3s")
+    );
+}
+
+#[cfg(unix)]
+struct TestNodeStopGuard {
+    project_root: PathBuf,
+    work_dir: PathBuf,
+    preserve_work_dir: bool,
+    active: bool,
+}
+
+#[cfg(unix)]
+impl TestNodeStopGuard {
+    fn new(project_root: &Path, work_dir: &Path, preserve_work_dir: bool) -> Self {
+        Self {
+            project_root: project_root.to_path_buf(),
+            work_dir: work_dir.to_path_buf(),
+            preserve_work_dir,
+            active: true,
+        }
+    }
+
+    fn stop(mut self) {
+        test_node_stop_command(&self.project_root, &self.work_dir, self.preserve_work_dir)
+            .assert()
+            .success();
+        self.active = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TestNodeStopGuard {
+    fn drop(&mut self) {
+        if self.active {
+            match test_node_stop_command(&self.project_root, &self.work_dir, self.preserve_work_dir)
+                .output()
+            {
+                Ok(output) if output.status.success() => {}
+                Ok(output) => {
+                    eprintln!(
+                        "test-node cleanup failed for {}: status={}\nstdout:\n{}\nstderr:\n{}",
+                        self.work_dir.display(),
+                        output.status,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                Err(err) => {
+                    eprintln!(
+                        "test-node cleanup failed for {}: {err}",
+                        self.work_dir.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn test_node_stop_command(
+    project_root: &Path,
+    work_dir: &Path,
+    preserve_work_dir: bool,
+) -> Command {
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("logos-scaffold"));
+    command
+        .current_dir(project_root)
+        .arg("test-node")
+        .arg("stop")
+        .arg("--node")
+        .arg(work_dir);
+    if preserve_work_dir {
+        command.arg("--preserve-work-dir");
+    }
+    command
+}
+
 fn write_scaffold_toml_with_localnet(
     project_root: &Path,
     lez_path: &Path,
@@ -3141,9 +3639,10 @@ fn setup_wallet_project(project_root: &Path, sequencer_addr: Option<&str>) {
 }
 
 /// Place a minimal `spel` stub at `<spel_path>/target/release/spel`. It
-/// emits the canonical `   ImageID (hex bytes): <hex>` line that
-/// `extract_program_id` parses, with a deterministic-per-binary hash so
-/// tests can assert exact values. Honors:
+/// mirrors the spel v0.5.0 surface: `program-id <FILE>` emits the canonical
+/// `   ImageID (hex bytes): <hex>` line that `extract_program_id` parses,
+/// with a deterministic-per-binary hash so tests can assert exact values.
+/// Honors:
 ///   `SPEL_FAIL=1`              → exit non-zero (proxy exit-code test)
 ///   `SPEL_PROGRAM_ID_FAIL=<n>` → exit non-zero only when arg2 basename
 ///                                contains `<n>` (program-id-unavailable
@@ -3159,13 +3658,13 @@ if [ "${SPEL_FAIL:-0}" = "1" ]; then
   exit 7
 fi
 
-if [ "$#" -ge 2 ] && [ "$1" = "inspect" ]; then
+if [ "$#" -ge 2 ] && [ "$1" = "program-id" ]; then
   bin_path="$2"
   bin_name="$(basename "$bin_path")"
   if [ -n "${SPEL_PROGRAM_ID_FAIL:-}" ]; then
     case "$bin_name" in
       *"$SPEL_PROGRAM_ID_FAIL"*)
-        echo "spel stub: forced inspect failure for $bin_name" >&2
+        echo "spel stub: forced program-id failure for $bin_name" >&2
         exit 8
         ;;
     esac
@@ -3364,7 +3863,22 @@ struct RpcStub {
 }
 
 impl RpcStub {
+    /// Monotonically increasing head: deploy pacing waits for the block id
+    /// to advance between submissions, so a constant value would park every
+    /// multi-program deploy test in the pacing timeout. Incrementing per
+    /// poll mirrors a live sequencer.
     fn start() -> Self {
+        Self::start_with_advance(true)
+    }
+
+    /// Constant head: models a sequencer whose block production has stalled,
+    /// for asserting that deploy pacing aborts fail-closed instead of
+    /// batching the remaining ELFs unpaced.
+    fn start_stalled() -> Self {
+        Self::start_with_advance(false)
+    }
+
+    fn start_with_advance(advance: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind rpc stub");
         let addr = listener.local_addr().expect("local addr");
         let addr_str = addr.to_string();
@@ -3376,10 +3890,14 @@ impl RpcStub {
         let stop_flag = Arc::clone(&stop);
 
         let handle = thread::spawn(move || {
+            let mut block_id: u64 = 123;
             while !stop_flag.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        respond_last_block(&mut stream);
+                        respond_last_block(&mut stream, block_id);
+                        if advance {
+                            block_id += 1;
+                        }
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
@@ -3408,11 +3926,11 @@ impl Drop for RpcStub {
     }
 }
 
-fn respond_last_block(stream: &mut TcpStream) {
+fn respond_last_block(stream: &mut TcpStream, block_id: u64) {
     let mut buf = [0_u8; 4096];
     let _ = stream.read(&mut buf);
 
-    let body = r#"{"jsonrpc":"2.0","result":123,"id":1}"#;
+    let body = format!(r#"{{"jsonrpc":"2.0","result":{block_id},"id":1}}"#);
     let response = format!(
         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
         body.len(),
@@ -4088,33 +4606,24 @@ fn setup_hard_fails_on_pre_v0_2_0_scaffold_toml() {
     assert_pre_v0_2_0_rejection(&["setup"]);
 }
 
-/// F1: `setup` must bail with the scaffold-styled circuits-prereq error
-/// before any cargo work when neither `LOGOS_BLOCKCHAIN_CIRCUITS` nor
-/// `~/.logos-blockchain-circuits/` is reachable. End-to-end check that the
-/// `check_logos_blockchain_circuits` precheck is wired into `cmd_setup`.
+/// F1: `doctor` must surface the configured circuits install directory when
+/// the release has not been fetched yet.
 #[test]
-fn setup_bails_with_scaffold_styled_error_when_circuits_missing() {
+fn doctor_reports_configured_circuits_missing() {
     let temp = tempdir().expect("tempdir");
     let project = temp.path();
     fs::write(project.join("scaffold.toml"), MINIMAL_SCAFFOLD_TOML).expect("write scaffold.toml");
 
-    // Point HOME at a directory with no `.logos-blockchain-circuits` so the
-    // home-dir fallback also fails — otherwise the developer running the
-    // suite would silently pass via their real $HOME.
-    let fake_home = project.join("fake-home");
-    fs::create_dir_all(&fake_home).expect("mkdir fake home");
-
     Command::new(assert_cmd::cargo::cargo_bin!("logos-scaffold"))
         .current_dir(project)
-        .env("HOME", &fake_home)
         .env_remove("LOGOS_BLOCKCHAIN_CIRCUITS")
-        .arg("setup")
+        .arg("doctor")
         .assert()
         .failure()
-        .stderr(
+        .stdout(
             predicate::str::contains("logos-blockchain-circuits")
-                .and(predicate::str::contains("$LOGOS_BLOCKCHAIN_CIRCUITS unset"))
-                .and(predicate::str::contains("logos-scaffold doctor"))
+                .and(predicate::str::contains(".scaffold/circuits"))
+                .and(predicate::str::contains("logos-scaffold setup"))
                 // Must NOT surface a raw cargo build-script panic.
                 .and(predicate::str::contains("logos-blockchain-pol").not())
                 .and(predicate::str::contains("build script").not()),
@@ -4537,4 +5046,30 @@ fn run_no_reset_flag_overrides_config_reset_true() {
         .failure()
         .stdout(predicate::str::contains("[1/5] Building..."))
         .stderr(predicate::str::contains("scaffold.toml requested reset = true").not());
+}
+
+#[test]
+fn basecamp_paths_json_resolves_custom_profile_manifest() {
+    // `basecamp paths` is pure path resolution: it needs only a loadable
+    // project (no setup, no nix) and accepts any profile name.
+    let temp = tempdir().expect("tempdir");
+    let lez_path = temp.path().join("lez");
+    fs::create_dir_all(&lez_path).expect("create lez path");
+    write_scaffold_toml(temp.path(), &lez_path);
+
+    Command::new(assert_cmd::cargo::cargo_bin!("logos-scaffold"))
+        .current_dir(temp.path())
+        .arg("basecamp")
+        .arg("paths")
+        .arg("carol")
+        .arg("--json")
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\"profile\": \"carol\"")
+                .and(predicate::str::contains("\"modules_dir\""))
+                .and(predicate::str::contains(
+                    ".scaffold/basecamp/profiles/carol",
+                )),
+        );
 }
